@@ -1,151 +1,357 @@
-import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+# -*- coding: utf-8 -*-
+"""
+Dashboard comercial conectado a Odoo 19 vía XML-RPC.
+Modelos: sale.order, account.move, crm.lead — segmentado por equipos de ventas (crm.team).
+Pensado para desplegarse en Streamlit Community Cloud (share.streamlit.io).
+"""
 
-# Set the title and favicon that appear in the Browser's tab bar.
+import xmlrpc.client
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# ─────────────────────────────────────────────
+# Configuración de página
+# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="Dashboard Comercial · Odoo 19",
+    page_icon="📊",
+    layout="wide",
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# ─────────────────────────────────────────────
+# Conexión a Odoo (XML-RPC)
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner="Conectando con Odoo...")
+def get_connection():
+    """Autentica una sola vez y reutiliza la conexión en toda la sesión."""
+    cfg = st.secrets["odoo"]
+    common = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/common", allow_none=True)
+    uid = common.authenticate(cfg["db"], cfg["username"], cfg["api_key"], {})
+    if not uid:
+        st.error("❌ Autenticación fallida. Verifica url, db, username y api_key en los Secrets.")
+        st.stop()
+    models = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/object", allow_none=True)
+    return cfg, uid, models
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+def odoo_call(model: str, method: str, args: list, kwargs: dict | None = None):
+    cfg, uid, models = get_connection()
+    return models.execute_kw(
+        cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {}
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
 
-    return gdp_df
+def search_read(model: str, domain: list, fields: list, **kw) -> pd.DataFrame:
+    records = odoo_call(model, "search_read", [domain], {"fields": fields, **kw})
+    df = pd.DataFrame(records)
+    if df.empty:
+        return pd.DataFrame(columns=fields)
+    return df
 
-gdp_df = get_gdp_data()
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+def m2o_name(series: pd.Series) -> pd.Series:
+    """Convierte columnas many2one [id, 'nombre'] → 'nombre'."""
+    return series.apply(lambda v: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else "Sin asignar")
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+def m2o_id(series: pd.Series) -> pd.Series:
+    return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
 
-# Add some spacing
-''
-''
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+# ─────────────────────────────────────────────
+# Carga de datos (cacheada 10 min)
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner="Cargando equipos de venta...")
+def load_teams() -> pd.DataFrame:
+    return search_read("crm.team", [], ["id", "name"], order="name")
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
 
-countries = gdp_df['Country Code'].unique()
+@st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
+def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    domain = [
+        ("date_order", ">=", date_from),
+        ("date_order", "<=", f"{date_to} 23:59:59"),
+        ("state", "in", ["sale", "done"]),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "sale.order",
+        domain,
+        ["name", "date_order", "partner_id", "user_id", "team_id",
+         "amount_untaxed", "amount_total", "state"],
+        order="date_order",
+    )
+    if df.empty:
+        return df
+    df["date_order"] = pd.to_datetime(df["date_order"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["cliente"] = m2o_name(df["partner_id"])
+    return df
 
-if not len(countries):
-    st.warning("Select at least one country")
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+@st.cache_data(ttl=600, show_spinner="Cargando facturas...")
+def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    domain = [
+        ("move_type", "in", ["out_invoice", "out_refund"]),
+        ("state", "=", "posted"),
+        ("invoice_date", ">=", date_from),
+        ("invoice_date", "<=", date_to),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "account.move",
+        domain,
+        ["name", "invoice_date", "partner_id", "invoice_user_id", "team_id",
+         "amount_untaxed_signed", "amount_total_signed", "amount_residual_signed",
+         "payment_state", "move_type"],
+        order="invoice_date",
+    )
+    if df.empty:
+        return df
+    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["vendedor"] = m2o_name(df["invoice_user_id"])
+    df["cliente"] = m2o_name(df["partner_id"])
+    return df
 
-''
-''
-''
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+@st.cache_data(ttl=600, show_spinner="Cargando pipeline CRM...")
+def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    # active in (True, False) para incluir oportunidades perdidas
+    domain = [
+        ("create_date", ">=", date_from),
+        ("create_date", "<=", f"{date_to} 23:59:59"),
+        ("type", "=", "opportunity"),
+        "|", ("active", "=", True), ("active", "=", False),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "crm.lead",
+        domain,
+        ["name", "create_date", "date_closed", "partner_id", "user_id", "team_id",
+         "stage_id", "expected_revenue", "probability", "active"],
+        order="create_date",
+    )
+    if df.empty:
+        return df
+    df["create_date"] = pd.to_datetime(df["create_date"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["etapa"] = m2o_name(df["stage_id"])
+    df["estado"] = df.apply(
+        lambda r: "Ganada" if r["probability"] == 100
+        else ("Perdida" if not r["active"] else "Abierta"),
+        axis=1,
+    )
+    return df
 
-st.header('GDP over time', divider='gray')
 
-''
+def fmt_money(v: float) -> str:
+    return f"${v:,.0f}"
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+
+# ─────────────────────────────────────────────
+# Sidebar: filtros globales
+# ─────────────────────────────────────────────
+st.sidebar.title("⚙️ Filtros")
+
+hoy = date.today()
+rango = st.sidebar.date_input(
+    "Rango de fechas",
+    value=(hoy.replace(day=1) - timedelta(days=90), hoy),
+    max_value=hoy,
 )
+if isinstance(rango, tuple) and len(rango) == 2:
+    date_from, date_to = rango
+else:
+    st.stop()
 
-''
-''
+teams_df = load_teams()
+team_names = st.sidebar.multiselect(
+    "Equipos de venta",
+    options=teams_df["name"].tolist(),
+    default=[],
+    placeholder="Todos los equipos",
+)
+team_ids = teams_df.loc[teams_df["name"].isin(team_names), "id"].tolist()
 
+if st.sidebar.button("🔄 Refrescar datos"):
+    st.cache_data.clear()
+    st.rerun()
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+st.sidebar.caption(f"Datos cacheados por 10 min · {datetime.now():%H:%M}")
 
-st.header(f'GDP in {to_year}', divider='gray')
+# ─────────────────────────────────────────────
+# Carga
+# ─────────────────────────────────────────────
+d1, d2 = date_from.isoformat(), date_to.isoformat()
+sales = load_sales(d1, d2, team_ids)
+invoices = load_invoices(d1, d2, team_ids)
+leads = load_leads(d1, d2, team_ids)
 
-''
+st.title("📊 Dashboard Comercial")
+st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
+           + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-cols = st.columns(4)
+tab_ventas, tab_fact, tab_crm = st.tabs(["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline"])
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+# ─────────────────────────────────────────────
+# TAB 1: Ventas (sale.order)
+# ─────────────────────────────────────────────
+with tab_ventas:
+    if sales.empty:
+        st.info("No hay órdenes de venta confirmadas en el período seleccionado.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Órdenes confirmadas", len(sales))
+        c2.metric("Ventas (sin imp.)", fmt_money(sales["amount_untaxed"].sum()))
+        c3.metric("Ventas (total)", fmt_money(sales["amount_total"].sum()))
+        c4.metric("Ticket promedio", fmt_money(sales["amount_total"].mean()))
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+        col_a, col_b = st.columns(2)
+        with col_a:
+            por_equipo = (sales.groupby("equipo", as_index=False)["amount_total"]
+                          .sum().sort_values("amount_total", ascending=False))
+            fig = px.bar(por_equipo, x="equipo", y="amount_total",
+                         title="Ventas por equipo", text_auto=".2s",
+                         labels={"amount_total": "Total", "equipo": "Equipo"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            mensual = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
+                       .groupby(["mes", "equipo"], as_index=False)["amount_total"].sum())
+            fig = px.line(mensual, x="mes", y="amount_total", color="equipo",
+                          markers=True, title="Evolución mensual por equipo",
+                          labels={"amount_total": "Total", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+        col_c, col_d = st.columns(2)
+        with col_c:
+            por_vendedor = (sales.groupby("vendedor", as_index=False)["amount_total"]
+                            .sum().sort_values("amount_total", ascending=True).tail(10))
+            fig = px.bar(por_vendedor, x="amount_total", y="vendedor", orientation="h",
+                         title="Top 10 vendedores", text_auto=".2s",
+                         labels={"amount_total": "Total", "vendedor": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_d:
+            top_clientes = (sales.groupby("cliente", as_index=False)["amount_total"]
+                            .sum().sort_values("amount_total", ascending=True).tail(10))
+            fig = px.bar(top_clientes, x="amount_total", y="cliente", orientation="h",
+                         title="Top 10 clientes", text_auto=".2s",
+                         labels={"amount_total": "Total", "cliente": ""})
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+        with st.expander("📋 Detalle de órdenes"):
+            st.dataframe(
+                sales[["name", "date_order", "cliente", "vendedor", "equipo",
+                       "amount_untaxed", "amount_total"]],
+                use_container_width=True, hide_index=True,
+            )
+
+# ─────────────────────────────────────────────
+# TAB 2: Facturación (account.move)
+# ─────────────────────────────────────────────
+with tab_fact:
+    if invoices.empty:
+        st.info("No hay facturas publicadas en el período seleccionado.")
+    else:
+        facturado = invoices["amount_total_signed"].sum()
+        pendiente = invoices["amount_residual_signed"].sum()
+        nc = (invoices["move_type"] == "out_refund").sum()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Documentos", len(invoices))
+        c2.metric("Facturado neto", fmt_money(facturado))
+        c3.metric("Cartera pendiente", fmt_money(pendiente))
+        c4.metric("Notas crédito", int(nc))
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            por_equipo = (invoices.groupby("equipo", as_index=False)["amount_total_signed"]
+                          .sum().sort_values("amount_total_signed", ascending=False))
+            fig = px.bar(por_equipo, x="equipo", y="amount_total_signed",
+                         title="Facturación neta por equipo", text_auto=".2s",
+                         labels={"amount_total_signed": "Total", "equipo": "Equipo"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            estado_pago = (invoices.groupby("payment_state", as_index=False)["amount_total_signed"]
+                           .sum())
+            etiquetas = {"not_paid": "No pagada", "in_payment": "En pago",
+                         "paid": "Pagada", "partial": "Parcial", "reversed": "Revertida"}
+            estado_pago["estado"] = estado_pago["payment_state"].map(etiquetas).fillna(estado_pago["payment_state"])
+            fig = px.pie(estado_pago, names="estado", values="amount_total_signed",
+                         title="Distribución por estado de pago", hole=0.45)
+            st.plotly_chart(fig, use_container_width=True)
+
+        mensual = (invoices.assign(mes=invoices["invoice_date"].dt.to_period("M").astype(str))
+                   .groupby(["mes", "equipo"], as_index=False)["amount_total_signed"].sum())
+        fig = px.bar(mensual, x="mes", y="amount_total_signed", color="equipo",
+                     barmode="group", title="Facturación mensual por equipo",
+                     labels={"amount_total_signed": "Total", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de facturas"):
+            st.dataframe(
+                invoices[["name", "invoice_date", "cliente", "vendedor", "equipo",
+                          "amount_total_signed", "amount_residual_signed", "payment_state"]],
+                use_container_width=True, hide_index=True,
+            )
+
+# ─────────────────────────────────────────────
+# TAB 3: CRM (crm.lead)
+# ─────────────────────────────────────────────
+with tab_crm:
+    if leads.empty:
+        st.info("No hay oportunidades creadas en el período seleccionado.")
+    else:
+        abiertas = leads[leads["estado"] == "Abierta"]
+        ganadas = leads[leads["estado"] == "Ganada"]
+        perdidas = leads[leads["estado"] == "Perdida"]
+        cerradas = len(ganadas) + len(perdidas)
+        win_rate = len(ganadas) / cerradas * 100 if cerradas else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Oportunidades", len(leads))
+        c2.metric("Pipeline abierto", fmt_money(abiertas["expected_revenue"].sum()))
+        c3.metric("Ingresos ganados", fmt_money(ganadas["expected_revenue"].sum()))
+        c4.metric("Tasa de conversión", f"{win_rate:.1f}%")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            embudo = (abiertas.groupby("etapa", as_index=False)
+                      .agg(oportunidades=("name", "count"),
+                           valor=("expected_revenue", "sum")))
+            fig = px.funnel(embudo, x="valor", y="etapa",
+                            title="Embudo de pipeline abierto (valor esperado)")
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            por_equipo = (leads.groupby(["equipo", "estado"], as_index=False)
+                          .agg(n=("name", "count")))
+            fig = px.bar(por_equipo, x="equipo", y="n", color="estado",
+                         title="Oportunidades por equipo y estado",
+                         color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
+                                             "Abierta": "#1f77b4"},
+                         labels={"n": "Oportunidades", "equipo": "Equipo"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        por_vendedor = (leads.groupby(["vendedor", "estado"], as_index=False)
+                        .agg(valor=("expected_revenue", "sum")))
+        fig = px.bar(por_vendedor, x="vendedor", y="valor", color="estado",
+                     title="Valor esperado por vendedor",
+                     color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
+                                         "Abierta": "#1f77b4"},
+                     labels={"valor": "Valor esperado", "vendedor": ""})
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de oportunidades"):
+            st.dataframe(
+                leads[["name", "create_date", "vendedor", "equipo", "etapa",
+                       "expected_revenue", "probability", "estado"]],
+                use_container_width=True, hide_index=True,
+            )
