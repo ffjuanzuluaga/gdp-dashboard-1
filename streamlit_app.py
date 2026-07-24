@@ -108,8 +108,8 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
 @st.cache_data(ttl=600, show_spinner="Cargando historial completo de facturación...")
 def load_all_invoices(team_ids: list[int]) -> pd.DataFrame:
     """TODO el historial de facturas publicadas (sin límite de fecha), para poder
-    saber el año de la primera factura de cada cliente y así distinguir clientes
-    nuevos de recurrentes, sin importar el rango de fechas del sidebar."""
+    saber la fecha de la primera factura de cada cliente y así distinguir clientes
+    nuevos de recurrentes respecto al rango de fechas del sidebar."""
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
@@ -124,7 +124,36 @@ def load_all_invoices(team_ids: list[int]) -> pd.DataFrame:
     if df.empty:
         return df
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    df["anio"] = df["invoice_date"].dt.year
+    df["cliente_id"] = m2o_id(df["partner_id"])
+    df["cliente"] = m2o_name(df["partner_id"])
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando facturación de Soporte...")
+def load_soporte_lines(team_ids: list[int]) -> pd.DataFrame:
+    """TODO el historial de líneas de factura de la categoría de producto
+    'Soporte' (sin límite de fecha), para poder saber desde cuándo se le
+    factura soporte/mantenimiento a cada cliente."""
+    domain = [
+        ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
+        ("move_id.state", "=", "posted"),
+        ("product_id.categ_id.name", "=", "Soporte"),
+    ]
+    if team_ids:
+        domain.append(("move_id.team_id", "in", team_ids))
+    df = search_read(
+        "account.move.line", domain,
+        ["date", "partner_id", "price_subtotal", "move_type"],
+        order="date",
+    )
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    df["monto"] = df.apply(
+        lambda r: -r["price_subtotal"] if r["move_type"] == "out_refund" else r["price_subtotal"],
+        axis=1,
+    )
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
     df["cliente_id"] = m2o_id(df["partner_id"])
     df["cliente"] = m2o_name(df["partner_id"])
     return df
@@ -388,9 +417,10 @@ st.title("📊 Dashboard Comercial")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes = st.tabs(
+tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes, tab_soporte = st.tabs(
     ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "📨 Leads y Conversión",
-     "🏆 Metas por vendedor", "🏷️ Metas por línea", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes"]
+     "🏆 Metas por vendedor", "🏷️ Metas por línea", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes",
+     "🛠️ Soporte y Mantenimiento"]
 )
 
 # ─────────────────────────────────────────────
@@ -847,27 +877,27 @@ with tab_lineas:
 # TAB: Clientes Nuevos vs. Recurrentes
 # ─────────────────────────────────────────────
 with tab_clientes:
-    anio_c = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
-                          index=0, key="anio_clientes")
-
     all_invoices = load_all_invoices(team_ids)
 
     if all_invoices.empty:
         st.info("No hay facturas publicadas en el historial.")
     else:
-        # Año de la primera factura histórica de cada cliente (sin límite de fecha)
-        primera_factura = (all_invoices.groupby("cliente_id")["anio"].min()
-                           .rename("anio_primera_factura"))
+        # Primera factura histórica de cada cliente (sin límite de fecha, para saber
+        # si ya existía ANTES de que empezara el rango de fechas del sidebar)
+        primera_factura = (all_invoices.groupby("cliente_id")["invoice_date"].min()
+                           .rename("primera_factura"))
 
-        fact_anio = all_invoices[all_invoices["anio"] == anio_c]
-        if fact_anio.empty:
-            st.info(f"No hay facturas publicadas en {anio_c} para los filtros seleccionados.")
+        mask_periodo = ((all_invoices["invoice_date"].dt.date >= date_from)
+                        & (all_invoices["invoice_date"].dt.date <= date_to))
+        fact_periodo = all_invoices[mask_periodo]
+        if fact_periodo.empty:
+            st.info("No hay facturas publicadas en el período seleccionado.")
         else:
-            resumen = (fact_anio.groupby(["cliente_id", "cliente"], as_index=False)
+            resumen = (fact_periodo.groupby(["cliente_id", "cliente"], as_index=False)
                       ["amount_total_signed"].sum())
             resumen = resumen.merge(primera_factura, on="cliente_id", how="left")
-            resumen["segmento"] = resumen["anio_primera_factura"].apply(
-                lambda y: "Nuevo" if y == anio_c else "Recurrente")
+            resumen["segmento"] = resumen["primera_factura"].apply(
+                lambda d: "Nuevo" if d.date() >= date_from else "Recurrente")
 
             nuevos = resumen[resumen["segmento"] == "Nuevo"]
             recurrentes = resumen[resumen["segmento"] == "Recurrente"]
@@ -878,9 +908,9 @@ with tab_clientes:
             c3.metric("Clientes recurrentes", len(recurrentes))
             c4.metric("% clientes nuevos",
                       f"{len(nuevos) / len(resumen) * 100:.1f}%" if len(resumen) else "—")
-            st.caption(f"\"Nuevo\" = su primera factura registrada (en todo el historial) fue en "
-                      f"{anio_c}. \"Recurrente\" = ya se le había facturado en algún año anterior "
-                      f"y se le volvió a facturar en {anio_c}.")
+            st.caption("\"Nuevo\" = su primera factura registrada (en todo el historial) cae "
+                      "dentro del rango de fechas seleccionado en el sidebar. \"Recurrente\" = "
+                      "ya se le había facturado antes de que empezara ese rango.")
 
             col_a, col_b = st.columns(2)
             with col_a:
@@ -894,7 +924,7 @@ with tab_clientes:
             with col_b:
                 fact_seg = resumen.groupby("segmento", as_index=False)["amount_total_signed"].sum()
                 fig = px.pie(fact_seg, names="segmento", values="amount_total_signed",
-                            title="Facturación del año: nuevos vs. recurrentes", hole=0.45,
+                            title="Facturación del período: nuevos vs. recurrentes", hole=0.45,
                             color="segmento",
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
                 st.plotly_chart(fig, use_container_width=True)
@@ -921,7 +951,7 @@ with tab_clientes:
                 },
             )
 
-            with st.expander(f"📋 Clientes NUEVOS en {anio_c} ({len(nuevos)})"):
+            with st.expander(f"📋 Clientes NUEVOS en el período ({len(nuevos)})"):
                 st.dataframe(
                     nuevos[["cliente", "amount_total_signed"]]
                         .sort_values("amount_total_signed", ascending=False),
@@ -931,18 +961,98 @@ with tab_clientes:
                         "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
                     },
                 )
-            with st.expander(f"📋 Clientes RECURRENTES en {anio_c} ({len(recurrentes)})"):
+            with st.expander(f"📋 Clientes RECURRENTES en el período ({len(recurrentes)})"):
                 recurrentes_tabla = recurrentes.copy()
-                recurrentes_tabla["antiguedad_anios"] = anio_c - recurrentes_tabla["anio_primera_factura"]
+                recurrentes_tabla["cliente_desde"] = recurrentes_tabla["primera_factura"].dt.date
+                recurrentes_tabla["antiguedad_anios"] = (
+                    (pd.Timestamp(date_to) - recurrentes_tabla["primera_factura"]).dt.days / 365.25
+                ).round(1)
                 st.dataframe(
-                    recurrentes_tabla[["cliente", "anio_primera_factura", "antiguedad_anios",
+                    recurrentes_tabla[["cliente", "cliente_desde", "antiguedad_anios",
                                        "amount_total_signed"]]
                         .sort_values("amount_total_signed", ascending=False),
                     use_container_width=True, hide_index=True,
                     column_config={
                         "cliente": "Cliente",
-                        "anio_primera_factura": "Cliente desde",
+                        "cliente_desde": "Cliente desde",
                         "antiguedad_anios": "Antigüedad (años)",
                         "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    },
+                )
+
+# ─────────────────────────────────────────────
+# TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
+# ─────────────────────────────────────────────
+with tab_soporte:
+    soporte_lines = load_soporte_lines(team_ids)
+
+    if soporte_lines.empty:
+        st.info("No hay facturación de la categoría 'Soporte' en el historial.")
+    else:
+        # Primera vez que se facturó Soporte a cada cliente (sin límite de fecha)
+        primera_soporte = (soporte_lines.groupby("cliente_id")["date"].min()
+                           .rename("primera_factura_soporte"))
+
+        mask_periodo = ((soporte_lines["date"].dt.date >= date_from)
+                        & (soporte_lines["date"].dt.date <= date_to))
+        soporte_periodo = soporte_lines[mask_periodo].copy()
+
+        if soporte_periodo.empty:
+            st.info("No hay facturación de Soporte en el período seleccionado.")
+        else:
+            soporte_periodo = soporte_periodo.merge(primera_soporte, on="cliente_id", how="left")
+            soporte_periodo["segmento"] = soporte_periodo["primera_factura_soporte"].apply(
+                lambda d: "Nuevo" if d.date() >= date_from else "Ya se facturaba antes")
+
+            total_periodo = soporte_periodo["monto"].sum()
+            nuevo_monto = soporte_periodo.loc[soporte_periodo["segmento"] == "Nuevo", "monto"].sum()
+            recurrente_monto = total_periodo - nuevo_monto
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Facturado Soporte (período)", fmt_money(total_periodo))
+            c2.metric("De clientes nuevos", fmt_money(nuevo_monto))
+            c3.metric("De clientes que ya se facturaban", fmt_money(recurrente_monto))
+            c4.metric("% nuevo", f"{nuevo_monto / total_periodo * 100:.1f}%" if total_periodo else "—")
+            st.caption("\"Nuevo\" = la primera factura de Soporte de ese cliente (en todo el "
+                      "historial) cae dentro del rango de fechas del sidebar. \"Ya se facturaba "
+                      "antes\" = ya se le venía facturando Soporte desde antes de que empezara "
+                      "ese rango.")
+
+            mensual_seg = (soporte_periodo.groupby(["mes", "segmento"], as_index=False)["monto"].sum())
+            fig = px.bar(mensual_seg, x="mes", y="monto", color="segmento", barmode="stack",
+                         title="Facturación de Soporte por mes: nuevo vs. ya se facturaba",
+                         color_discrete_map={"Nuevo": "#1f77b4", "Ya se facturaba antes": "#9ca3af"},
+                         labels={"monto": "Facturado", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Comparativo de facturación de Soporte")
+            resumen_seg = soporte_periodo.groupby("segmento", as_index=False)["monto"].sum()
+            orden_seg = {"Nuevo": 0, "Ya se facturaba antes": 1}
+            resumen_seg = resumen_seg.sort_values(by="segmento", key=lambda s: s.map(orden_seg))
+            resumen_seg["pct_total"] = (
+                resumen_seg["monto"] / total_periodo * 100 if total_periodo else 0.0)
+            fila_total = pd.DataFrame([{
+                "segmento": "Total", "monto": total_periodo,
+                "pct_total": 100.0 if total_periodo else 0.0,
+            }])
+            tabla_soporte = pd.concat([resumen_seg, fila_total], ignore_index=True)
+            st.dataframe(
+                tabla_soporte, use_container_width=True, hide_index=True,
+                column_config={
+                    "segmento": "Segmento",
+                    "monto": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    "pct_total": st.column_config.NumberColumn("% del total", format="%.1f%%"),
+                },
+            )
+
+            por_cliente = (soporte_periodo.groupby(["cliente", "segmento"], as_index=False)["monto"]
+                          .sum().sort_values("monto", ascending=False))
+            with st.expander("📋 Detalle por cliente"):
+                st.dataframe(
+                    por_cliente, use_container_width=True, hide_index=True,
+                    column_config={
+                        "cliente": "Cliente",
+                        "segmento": "Segmento",
+                        "monto": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
                     },
                 )
