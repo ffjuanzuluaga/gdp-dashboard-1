@@ -899,6 +899,28 @@ with tab_clientes:
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
                 st.plotly_chart(fig, use_container_width=True)
 
+            st.markdown("#### Comparativo de facturación: nuevos vs. recurrentes")
+            orden_segmento = {"Nuevo": 0, "Recurrente": 1}
+            fact_seg_tabla = fact_seg.sort_values(by="segmento", key=lambda s: s.map(orden_segmento))
+            total_fact = fact_seg_tabla["amount_total_signed"].sum()
+            fact_seg_tabla["pct_total"] = (
+                fact_seg_tabla["amount_total_signed"] / total_fact * 100 if total_fact else 0.0)
+            fila_total = pd.DataFrame([{
+                "segmento": "Total",
+                "amount_total_signed": total_fact,
+                "pct_total": 100.0 if total_fact else 0.0,
+            }])
+            tabla_comp = pd.concat([fact_seg_tabla, fila_total], ignore_index=True)
+            st.dataframe(
+                tabla_comp,
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "segmento": "Segmento",
+                    "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    "pct_total": st.column_config.NumberColumn("% del total", format="%.1f%%"),
+                },
+            )
+
             with st.expander(f"📋 Clientes NUEVOS en {anio_c} ({len(nuevos)})"):
                 st.dataframe(
                     nuevos[["cliente", "amount_total_signed"]]
