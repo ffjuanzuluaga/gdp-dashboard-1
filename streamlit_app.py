@@ -166,6 +166,24 @@ def load_metas() -> pd.DataFrame:
         return pd.DataFrame(columns=["vendedor", "meta_anual"])
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando metas por línea...")
+def load_metas_lineas() -> pd.DataFrame:
+    """Metas anuales por línea de negocio desde data/metas_lineas.csv.
+    El nombre en la columna 'linea' debe coincidir EXACTAMENTE con el
+    nombre de la etiqueta (crm.tag) en Odoo."""
+    try:
+        df = pd.read_csv("data/metas_lineas.csv")
+        df["linea"] = df["linea"].str.strip()
+        return df
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["linea", "meta_anual"])
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando etiquetas CRM...")
+def load_tags() -> pd.DataFrame:
+    return search_read("crm.tag", [], ["id", "name"], order="name")
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
 def load_won(year: int, team_ids: list[int]) -> pd.DataFrame:
     """Oportunidades GANADAS del año, por fecha de cierre (reporte de ganados)."""
@@ -190,6 +208,68 @@ def load_won(year: int, team_ids: list[int]) -> pd.DataFrame:
     df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando ganados por línea...")
+def load_won_lineas(year: int, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades GANADAS del año, explotadas por etiqueta (línea de negocio).
+    Si una oportunidad tiene varias etiquetas, su valor se cuenta en cada una."""
+    domain = [
+        ("type", "=", "opportunity"),
+        ("probability", "=", 100),
+        ("date_closed", ">=", f"{year}-01-01"),
+        ("date_closed", "<=", f"{year}-12-31 23:59:59"),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    cols = ["name", "date_closed", "vendedor", "equipo", "expected_revenue", "mes", "linea"]
+    df = search_read(
+        "crm.lead", domain,
+        ["name", "date_closed", "user_id", "team_id", "expected_revenue", "tag_ids"],
+        order="date_closed",
+    )
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    tag_names = load_tags().set_index("id")["name"]
+    df["date_closed"] = pd.to_datetime(df["date_closed"])
+    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["linea"] = df["tag_ids"].apply(
+        lambda ids: [tag_names.get(i, "Sin etiqueta") for i in ids] if ids else ["Sin etiqueta"])
+    df = df.explode("linea")
+    return df[cols]
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando leads y pipeline completo...")
+def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Todo el pipeline (leads + oportunidades) con origen, para el reporte de conversión."""
+    domain = [
+        ("create_date", ">=", date_from),
+        ("create_date", "<=", f"{date_to} 23:59:59"),
+        "|", ("active", "=", True), ("active", "=", False),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "crm.lead", domain,
+        ["name", "create_date", "user_id", "team_id", "source_id",
+         "expected_revenue", "probability", "active", "type"],
+        order="create_date",
+    )
+    if df.empty:
+        return df
+    df["create_date"] = pd.to_datetime(df["create_date"])
+    df["mes"] = df["create_date"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["origen"] = m2o_name(df["source_id"])
+    df["estado"] = df.apply(
+        lambda r: "Ganada" if r["probability"] == 100
+        else ("Perdida" if not r["active"] else "Abierta"),
+        axis=1,
+    )
     return df
 
 
@@ -235,13 +315,15 @@ d1, d2 = date_from.isoformat(), date_to.isoformat()
 sales = load_sales(d1, d2, team_ids)
 invoices = load_invoices(d1, d2, team_ids)
 leads = load_leads(d1, d2, team_ids)
+leads_full = load_leads_full(d1, d2, team_ids)
 
 st.title("📊 Dashboard Comercial")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-tab_ventas, tab_fact, tab_crm, tab_metas = st.tabs(
-    ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "🏆 Metas por vendedor"]
+tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas = st.tabs(
+    ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "📨 Leads y Conversión",
+     "🏆 Metas por vendedor", "🏷️ Metas por línea"]
 )
 
 # ─────────────────────────────────────────────
@@ -288,6 +370,13 @@ with tab_ventas:
                          title="Top 10 clientes", text_auto=".2s",
                          labels={"amount_total": "Total", "cliente": ""})
             st.plotly_chart(fig, use_container_width=True)
+
+        mensual_vendedor = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
+                            .groupby(["mes", "vendedor"], as_index=False)["amount_total"].sum())
+        fig = px.bar(mensual_vendedor, x="mes", y="amount_total", color="vendedor",
+                     barmode="group", title="Ventas por vendedor y mes",
+                     labels={"amount_total": "Total", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("📋 Detalle de órdenes"):
             st.dataframe(
@@ -399,11 +488,88 @@ with tab_crm:
             )
 
 # ─────────────────────────────────────────────
+# TAB: Leads y Conversión (todo el pipeline: leads + oportunidades)
+# ─────────────────────────────────────────────
+with tab_leads:
+    if leads_full.empty:
+        st.info("No hay leads ni oportunidades creados en el período seleccionado.")
+    else:
+        ganadas_f = leads_full[leads_full["estado"] == "Ganada"]
+        perdidas_f = leads_full[leads_full["estado"] == "Perdida"]
+        cerradas_f = len(ganadas_f) + len(perdidas_f)
+        tasa_global = len(ganadas_f) / cerradas_f * 100 if cerradas_f else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Leads / oportunidades", len(leads_full))
+        c2.metric("Ganadas", len(ganadas_f))
+        c3.metric("Perdidas", len(perdidas_f))
+        c4.metric("Tasa de conversión", f"{tasa_global:.1f}%")
+
+        mensual_vendedor = (leads_full.groupby(["mes", "vendedor"], as_index=False)
+                            .agg(leads=("name", "count")))
+        fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
+                     barmode="group", title="Leads por vendedor y mes",
+                     labels={"leads": "Leads", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            por_origen = (leads_full.groupby("origen", as_index=False)
+                          .agg(leads=("name", "count"))
+                          .sort_values("leads", ascending=True).tail(10))
+            fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
+                         title="Leads por origen", text_auto=True,
+                         labels={"leads": "Leads", "origen": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            conv_vendedor = leads_full.groupby("vendedor", as_index=False).agg(
+                leads=("name", "count"),
+                ganadas=("estado", lambda s: (s == "Ganada").sum()),
+                cerradas=("estado", lambda s: (s != "Abierta").sum()),
+            )
+            conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
+                lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
+            fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
+                         x="tasa_conversion", y="vendedor", orientation="h",
+                         title="Tasa de conversión por vendedor", text_auto=".1f",
+                         labels={"tasa_conversion": "% conversión", "vendedor": ""})
+            st.plotly_chart(fig, use_container_width=True)
+
+        conv_origen = leads_full.groupby("origen", as_index=False).agg(
+            leads=("name", "count"),
+            ganadas=("estado", lambda s: (s == "Ganada").sum()),
+            cerradas=("estado", lambda s: (s != "Abierta").sum()),
+        )
+        conv_origen["tasa_conversion"] = conv_origen.apply(
+            lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
+        st.markdown("#### Conversión por origen")
+        st.dataframe(
+            conv_origen.sort_values("leads", ascending=False),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "origen": "Origen",
+                "leads": "Leads",
+                "ganadas": "Ganadas",
+                "cerradas": "Cerradas",
+                "tasa_conversion": st.column_config.ProgressColumn(
+                    "% conversión", format="%.1f%%", min_value=0, max_value=100),
+            },
+        )
+
+        with st.expander("📋 Detalle de leads / oportunidades"):
+            st.dataframe(
+                leads_full[["name", "create_date", "vendedor", "equipo", "origen",
+                            "estado", "expected_revenue"]],
+                use_container_width=True, hide_index=True,
+            )
+
+# ─────────────────────────────────────────────
 # TAB 4: Metas por vendedor (ganados CRM vs metas.csv)
 # ─────────────────────────────────────────────
 with tab_metas:
     hoy = date.today()
-    anio = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1), index=0)
+    anio = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
+                        index=0, key="anio_metas")
 
     metas = load_metas()
     won = load_won(anio, team_ids)
@@ -489,5 +655,97 @@ with tab_metas:
         with st.expander("📋 Detalle de oportunidades ganadas"):
             st.dataframe(
                 won[["name", "date_closed", "vendedor", "equipo", "expected_revenue"]],
+                use_container_width=True, hide_index=True,
+            )
+
+# ─────────────────────────────────────────────
+# TAB: Metas por línea (ganados CRM clasificados por etiqueta vs metas_lineas.csv)
+# ─────────────────────────────────────────────
+with tab_lineas:
+    anio_l = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
+                          index=0, key="anio_lineas")
+
+    metas_lineas = load_metas_lineas()
+    won_lineas = load_won_lineas(anio_l, team_ids)
+
+    if metas_lineas.empty:
+        st.warning("No se encontró `data/metas_lineas.csv`. Crea el archivo con columnas "
+                   "`linea,meta_anual` en la raíz del repo (el nombre de `linea` debe "
+                   "coincidir EXACTAMENTE con la etiqueta configurada en Odoo CRM).")
+    elif won_lineas.empty:
+        st.info(f"No hay oportunidades ganadas en {anio_l} para los filtros seleccionados.")
+    else:
+        meses_transcurridos_l = hoy.month if anio_l == hoy.year else 12
+
+        ventas_linea = (won_lineas.groupby("linea", as_index=False)["expected_revenue"]
+                        .sum().rename(columns={"expected_revenue": "vendido"}))
+
+        cumpl_l = metas_lineas.merge(ventas_linea, on="linea", how="outer")
+        cumpl_l["meta_anual"] = cumpl_l["meta_anual"].fillna(0)
+        cumpl_l["vendido"] = cumpl_l["vendido"].fillna(0)
+        cumpl_l["meta_a_la_fecha"] = cumpl_l["meta_anual"] * meses_transcurridos_l / 12
+        cumpl_l["pct_a_la_fecha"] = cumpl_l.apply(
+            lambda r: r["vendido"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
+        cumpl_l["pct_anual"] = cumpl_l.apply(
+            lambda r: r["vendido"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
+        cumpl_l = cumpl_l.sort_values("pct_a_la_fecha", ascending=False)
+
+        sin_meta_l = cumpl_l[(cumpl_l["meta_anual"] == 0) & (cumpl_l["vendido"] > 0)]["linea"].tolist()
+        if sin_meta_l:
+            st.warning("⚠️ Líneas con ventas pero SIN meta en metas_lineas.csv (verifica que "
+                       f"el nombre coincida exactamente con la etiqueta en Odoo): {', '.join(sin_meta_l)}")
+
+        con_meta_l = cumpl_l[cumpl_l["meta_anual"] > 0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        total_meta_l = con_meta_l["meta_anual"].sum()
+        total_meta_fecha_l = con_meta_l["meta_a_la_fecha"].sum()
+        total_vendido_l = con_meta_l["vendido"].sum()
+        c1.metric("Meta anual (todas las líneas)", fmt_money(total_meta_l))
+        c2.metric(f"Meta a {hoy:%b} ({meses_transcurridos_l}/12)", fmt_money(total_meta_fecha_l))
+        c3.metric("Vendido (ganados)", fmt_money(total_vendido_l))
+        c4.metric("Cumplimiento a la fecha",
+                  f"{total_vendido_l / total_meta_fecha_l * 100:.1f}%" if total_meta_fecha_l else "—")
+
+        tabla_l = con_meta_l[["linea", "meta_anual", "meta_a_la_fecha", "vendido",
+                              "pct_a_la_fecha", "pct_anual"]].copy()
+        st.dataframe(
+            tabla_l,
+            use_container_width=True, hide_index=True,
+            column_config={
+                "linea": "Línea",
+                "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
+                "meta_a_la_fecha": st.column_config.NumberColumn("Meta a la fecha", format="$%,.0f"),
+                "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                "pct_a_la_fecha": st.column_config.ProgressColumn(
+                    "% a la fecha", format="%.1f%%", min_value=0, max_value=150),
+                "pct_anual": st.column_config.ProgressColumn(
+                    "% anual", format="%.1f%%", min_value=0, max_value=100),
+            },
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            comp_l = con_meta_l.melt(
+                id_vars="linea",
+                value_vars=["meta_a_la_fecha", "vendido"],
+                var_name="concepto", value_name="valor")
+            comp_l["concepto"] = comp_l["concepto"].map(
+                {"meta_a_la_fecha": "Meta a la fecha", "vendido": "Vendido"})
+            fig = px.bar(comp_l, x="linea", y="valor", color="concepto",
+                         barmode="group", title="Vendido vs. meta a la fecha por línea",
+                         color_discrete_map={"Meta a la fecha": "#9ca3af", "Vendido": "#1f77b4"},
+                         labels={"valor": "COP", "linea": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            mensual_l = (won_lineas.groupby(["mes", "linea"], as_index=False)["expected_revenue"].sum())
+            fig = px.bar(mensual_l, x="mes", y="expected_revenue", color="linea",
+                         title="Ganados por mes y línea",
+                         labels={"expected_revenue": "COP", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de oportunidades ganadas por línea"):
+            st.dataframe(
+                won_lineas[["name", "date_closed", "vendedor", "equipo", "linea", "expected_revenue"]],
                 use_container_width=True, hide_index=True,
             )
