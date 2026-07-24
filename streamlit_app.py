@@ -273,6 +273,36 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     return df
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando cierres del período...")
+def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades GANADAS o PERDIDAS con fecha de cierre en el período,
+    sin importar cuándo se crearon (incluye leads heredados de períodos
+    anteriores que se cerraron ahora). Se usa para la tasa de conversión."""
+    domain = [
+        ("type", "=", "opportunity"),
+        ("date_closed", ">=", date_from),
+        ("date_closed", "<=", f"{date_to} 23:59:59"),
+        "|", ("active", "=", True), ("active", "=", False),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "crm.lead", domain,
+        ["name", "date_closed", "user_id", "team_id", "source_id",
+         "expected_revenue", "probability", "active"],
+        order="date_closed",
+    )
+    if df.empty:
+        return df
+    df["date_closed"] = pd.to_datetime(df["date_closed"])
+    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["origen"] = m2o_name(df["source_id"])
+    df["estado"] = df.apply(lambda r: "Ganada" if r["probability"] == 100 else "Perdida", axis=1)
+    return df
+
+
 def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
@@ -316,6 +346,7 @@ sales = load_sales(d1, d2, team_ids)
 invoices = load_invoices(d1, d2, team_ids)
 leads = load_leads(d1, d2, team_ids)
 leads_full = load_leads_full(d1, d2, team_ids)
+closed = load_pipeline_closed(d1, d2, team_ids)
 
 st.title("📊 Dashboard Comercial")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
@@ -491,77 +522,91 @@ with tab_crm:
 # TAB: Leads y Conversión (todo el pipeline: leads + oportunidades)
 # ─────────────────────────────────────────────
 with tab_leads:
-    if leads_full.empty:
-        st.info("No hay leads ni oportunidades creados en el período seleccionado.")
+    if leads_full.empty and closed.empty:
+        st.info("No hay leads, oportunidades ni cierres en el período seleccionado.")
     else:
-        ganadas_f = leads_full[leads_full["estado"] == "Ganada"]
-        perdidas_f = leads_full[leads_full["estado"] == "Perdida"]
+        ganadas_f = closed[closed["estado"] == "Ganada"] if not closed.empty else closed
+        perdidas_f = closed[closed["estado"] == "Perdida"] if not closed.empty else closed
         cerradas_f = len(ganadas_f) + len(perdidas_f)
         tasa_global = len(ganadas_f) / cerradas_f * 100 if cerradas_f else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Leads / oportunidades", len(leads_full))
-        c2.metric("Ganadas", len(ganadas_f))
-        c3.metric("Perdidas", len(perdidas_f))
+        c1.metric("Leads creados", len(leads_full))
+        c2.metric("Ganadas (cerradas en el período)", len(ganadas_f))
+        c3.metric("Perdidas (cerradas en el período)", len(perdidas_f))
         c4.metric("Tasa de conversión", f"{tasa_global:.1f}%")
+        st.caption("Ganadas/Perdidas y la tasa de conversión se calculan por **fecha de "
+                   "cierre**, no por fecha de creación: incluyen oportunidades que venías "
+                   "trabajando desde antes del período y que se cerraron ahora. \"Leads "
+                   "creados\" sí es estrictamente por fecha de creación, así que ambos "
+                   "números no son necesariamente el mismo grupo de registros.")
 
-        mensual_vendedor = (leads_full.groupby(["mes", "vendedor"], as_index=False)
-                            .agg(leads=("name", "count")))
-        fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
-                     barmode="group", title="Leads por vendedor y mes",
-                     labels={"leads": "Leads", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
+        if not leads_full.empty:
+            mensual_vendedor = (leads_full.groupby(["mes", "vendedor"], as_index=False)
+                                .agg(leads=("name", "count")))
+            fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
+                         barmode="group", title="Leads creados por vendedor y mes",
+                         labels={"leads": "Leads", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
 
         col_a, col_b = st.columns(2)
         with col_a:
-            por_origen = (leads_full.groupby("origen", as_index=False)
-                          .agg(leads=("name", "count"))
-                          .sort_values("leads", ascending=True).tail(10))
-            fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
-                         title="Leads por origen", text_auto=True,
-                         labels={"leads": "Leads", "origen": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            if not leads_full.empty:
+                por_origen = (leads_full.groupby("origen", as_index=False)
+                              .agg(leads=("name", "count"))
+                              .sort_values("leads", ascending=True).tail(10))
+                fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
+                             title="Leads creados por origen", text_auto=True,
+                             labels={"leads": "Leads", "origen": ""})
+                st.plotly_chart(fig, use_container_width=True)
         with col_b:
-            conv_vendedor = leads_full.groupby("vendedor", as_index=False).agg(
-                leads=("name", "count"),
+            if not closed.empty:
+                conv_vendedor = closed.groupby("vendedor", as_index=False).agg(
+                    ganadas=("estado", lambda s: (s == "Ganada").sum()),
+                    cerradas=("estado", "count"),
+                )
+                conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
+                    lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
+                fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
+                             x="tasa_conversion", y="vendedor", orientation="h",
+                             title="Tasa de conversión por vendedor (por cierre)", text_auto=".1f",
+                             labels={"tasa_conversion": "% conversión", "vendedor": ""})
+                st.plotly_chart(fig, use_container_width=True)
+
+        if not closed.empty:
+            conv_origen = closed.groupby("origen", as_index=False).agg(
                 ganadas=("estado", lambda s: (s == "Ganada").sum()),
-                cerradas=("estado", lambda s: (s != "Abierta").sum()),
+                cerradas=("estado", "count"),
             )
-            conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
+            conv_origen["tasa_conversion"] = conv_origen.apply(
                 lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
-            fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
-                         x="tasa_conversion", y="vendedor", orientation="h",
-                         title="Tasa de conversión por vendedor", text_auto=".1f",
-                         labels={"tasa_conversion": "% conversión", "vendedor": ""})
-            st.plotly_chart(fig, use_container_width=True)
-
-        conv_origen = leads_full.groupby("origen", as_index=False).agg(
-            leads=("name", "count"),
-            ganadas=("estado", lambda s: (s == "Ganada").sum()),
-            cerradas=("estado", lambda s: (s != "Abierta").sum()),
-        )
-        conv_origen["tasa_conversion"] = conv_origen.apply(
-            lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
-        st.markdown("#### Conversión por origen")
-        st.dataframe(
-            conv_origen.sort_values("leads", ascending=False),
-            use_container_width=True, hide_index=True,
-            column_config={
-                "origen": "Origen",
-                "leads": "Leads",
-                "ganadas": "Ganadas",
-                "cerradas": "Cerradas",
-                "tasa_conversion": st.column_config.ProgressColumn(
-                    "% conversión", format="%.1f%%", min_value=0, max_value=100),
-            },
-        )
-
-        with st.expander("📋 Detalle de leads / oportunidades"):
+            st.markdown("#### Conversión por origen (por fecha de cierre)")
             st.dataframe(
-                leads_full[["name", "create_date", "vendedor", "equipo", "origen",
-                            "estado", "expected_revenue"]],
+                conv_origen.sort_values("cerradas", ascending=False),
                 use_container_width=True, hide_index=True,
+                column_config={
+                    "origen": "Origen",
+                    "ganadas": "Ganadas",
+                    "cerradas": "Cerradas",
+                    "tasa_conversion": st.column_config.ProgressColumn(
+                        "% conversión", format="%.1f%%", min_value=0, max_value=100),
+                },
             )
+
+        if not leads_full.empty:
+            with st.expander("📋 Detalle de leads creados en el período"):
+                st.dataframe(
+                    leads_full[["name", "create_date", "vendedor", "equipo", "origen",
+                                "estado", "expected_revenue"]],
+                    use_container_width=True, hide_index=True,
+                )
+        if not closed.empty:
+            with st.expander("📋 Detalle de cierres (ganados/perdidos) en el período"):
+                st.dataframe(
+                    closed[["name", "date_closed", "vendedor", "equipo", "origen",
+                            "estado", "expected_revenue"]],
+                    use_container_width=True, hide_index=True,
+                )
 
 # ─────────────────────────────────────────────
 # TAB 4: Metas por vendedor (ganados CRM vs metas.csv)
