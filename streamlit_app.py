@@ -153,6 +153,46 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     return df
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando metas...")
+def load_metas() -> pd.DataFrame:
+    """Metas anuales por vendedor desde metas.csv (en la raíz del repo).
+    El nombre en la columna 'vendedor' debe coincidir EXACTAMENTE con el
+    nombre del usuario en Odoo."""
+    try:
+        df = pd.read_csv("data/metas.csv")
+        df["vendedor"] = df["vendedor"].str.strip()
+        return df
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["vendedor", "meta_anual"])
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
+def load_won(year: int, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades GANADAS del año, por fecha de cierre (reporte de ganados)."""
+    domain = [
+        ("type", "=", "opportunity"),
+        ("probability", "=", 100),
+        ("date_closed", ">=", f"{year}-01-01"),
+        ("date_closed", "<=", f"{year}-12-31 23:59:59"),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "crm.lead",
+        domain,
+        ["name", "date_closed", "user_id", "team_id", "expected_revenue"],
+        order="date_closed",
+    )
+    if df.empty:
+        return df
+    df["date_closed"] = pd.to_datetime(df["date_closed"])
+    df["mes_num"] = df["date_closed"].dt.month
+    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    return df
+
+
 def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
@@ -200,7 +240,9 @@ st.title("📊 Dashboard Comercial")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-tab_ventas, tab_fact, tab_crm = st.tabs(["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline"])
+tab_ventas, tab_fact, tab_crm, tab_metas = st.tabs(
+    ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "🏆 Metas por vendedor"]
+)
 
 # ─────────────────────────────────────────────
 # TAB 1: Ventas (sale.order)
@@ -353,5 +395,99 @@ with tab_crm:
             st.dataframe(
                 leads[["name", "create_date", "vendedor", "equipo", "etapa",
                        "expected_revenue", "probability", "estado"]],
+                use_container_width=True, hide_index=True,
+            )
+
+# ─────────────────────────────────────────────
+# TAB 4: Metas por vendedor (ganados CRM vs metas.csv)
+# ─────────────────────────────────────────────
+with tab_metas:
+    hoy = date.today()
+    anio = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1), index=0)
+
+    metas = load_metas()
+    won = load_won(anio, team_ids)
+
+    if metas.empty:
+        st.warning("No se encontró `metas.csv` en el repositorio. Crea el archivo con "
+                   "columnas `vendedor,meta_anual` en la raíz del repo.")
+    elif won.empty:
+        st.info(f"No hay oportunidades ganadas en {anio} para los filtros seleccionados.")
+    else:
+        # Meses transcurridos: si es el año actual, el mes en curso; si es un año pasado, 12
+        meses_transcurridos = hoy.month if anio == hoy.year else 12
+
+        ventas_vendedor = (won.groupby("vendedor", as_index=False)["expected_revenue"]
+                           .sum().rename(columns={"expected_revenue": "vendido"}))
+
+        # outer merge: muestra vendedores con meta sin ventas y viceversa
+        cumpl = metas.merge(ventas_vendedor, on="vendedor", how="outer")
+        cumpl["meta_anual"] = cumpl["meta_anual"].fillna(0)
+        cumpl["vendido"] = cumpl["vendido"].fillna(0)
+        cumpl["meta_a_la_fecha"] = cumpl["meta_anual"] * meses_transcurridos / 12
+        cumpl["pct_a_la_fecha"] = cumpl.apply(
+            lambda r: r["vendido"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
+        cumpl["pct_anual"] = cumpl.apply(
+            lambda r: r["vendido"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
+        cumpl = cumpl.sort_values("pct_a_la_fecha", ascending=False)
+
+        sin_meta = cumpl[(cumpl["meta_anual"] == 0) & (cumpl["vendido"] > 0)]["vendedor"].tolist()
+        if sin_meta:
+            st.warning("⚠️ Vendedores con ventas pero SIN meta en metas.csv (verifica que el "
+                       f"nombre coincida exactamente con Odoo): {', '.join(sin_meta)}")
+
+        con_meta = cumpl[cumpl["meta_anual"] > 0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        total_meta = con_meta["meta_anual"].sum()
+        total_meta_fecha = con_meta["meta_a_la_fecha"].sum()
+        total_vendido = con_meta["vendido"].sum()
+        c1.metric("Meta anual (equipo)", fmt_money(total_meta))
+        c2.metric(f"Meta a {hoy:%b} ({meses_transcurridos}/12)", fmt_money(total_meta_fecha))
+        c3.metric("Vendido (ganados)", fmt_money(total_vendido))
+        c4.metric("Cumplimiento a la fecha",
+                  f"{total_vendido / total_meta_fecha * 100:.1f}%" if total_meta_fecha else "—")
+
+        # Tabla de cumplimiento
+        tabla = con_meta[["vendedor", "meta_anual", "meta_a_la_fecha", "vendido",
+                          "pct_a_la_fecha", "pct_anual"]].copy()
+        st.dataframe(
+            tabla,
+            use_container_width=True, hide_index=True,
+            column_config={
+                "vendedor": "Vendedor",
+                "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
+                "meta_a_la_fecha": st.column_config.NumberColumn("Meta a la fecha", format="$%,.0f"),
+                "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                "pct_a_la_fecha": st.column_config.ProgressColumn(
+                    "% a la fecha", format="%.1f%%", min_value=0, max_value=150),
+                "pct_anual": st.column_config.ProgressColumn(
+                    "% anual", format="%.1f%%", min_value=0, max_value=100),
+            },
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            comp = con_meta.melt(
+                id_vars="vendedor",
+                value_vars=["meta_a_la_fecha", "vendido"],
+                var_name="concepto", value_name="valor")
+            comp["concepto"] = comp["concepto"].map(
+                {"meta_a_la_fecha": "Meta a la fecha", "vendido": "Vendido"})
+            fig = px.bar(comp, x="vendedor", y="valor", color="concepto",
+                         barmode="group", title="Vendido vs. meta a la fecha",
+                         color_discrete_map={"Meta a la fecha": "#9ca3af", "Vendido": "#1f77b4"},
+                         labels={"valor": "COP", "vendedor": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            mensual = (won.groupby(["mes", "vendedor"], as_index=False)["expected_revenue"].sum())
+            fig = px.bar(mensual, x="mes", y="expected_revenue", color="vendedor",
+                         title="Ganados por mes y vendedor (reporte de ganados)",
+                         labels={"expected_revenue": "COP", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de oportunidades ganadas"):
+            st.dataframe(
+                won[["name", "date_closed", "vendedor", "equipo", "expected_revenue"]],
                 use_container_width=True, hide_index=True,
             )
