@@ -250,13 +250,13 @@ def load_tags() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
-def load_won(year: int, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades GANADAS del año, por fecha de cierre (reporte de ganados)."""
+def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades GANADAS con fecha de cierre en el período (reporte de ganados)."""
     domain = [
         ("type", "=", "opportunity"),
         ("probability", "=", 100),
-        ("date_closed", ">=", f"{year}-01-01"),
-        ("date_closed", "<=", f"{year}-12-31 23:59:59"),
+        ("date_closed", ">=", date_from),
+        ("date_closed", "<=", f"{date_to} 23:59:59"),
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
@@ -277,14 +277,15 @@ def load_won(year: int, team_ids: list[int]) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando ganados por línea...")
-def load_won_lineas(year: int, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades GANADAS del año, explotadas por etiqueta (línea de negocio).
-    Si una oportunidad tiene varias etiquetas, su valor se cuenta en cada una."""
+def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades GANADAS con fecha de cierre en el período, explotadas por etiqueta
+    (línea de negocio). Si una oportunidad tiene varias etiquetas, su valor se cuenta
+    en cada una."""
     domain = [
         ("type", "=", "opportunity"),
         ("probability", "=", 100),
-        ("date_closed", ">=", f"{year}-01-01"),
-        ("date_closed", "<=", f"{year}-12-31 23:59:59"),
+        ("date_closed", ">=", date_from),
+        ("date_closed", "<=", f"{date_to} 23:59:59"),
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
@@ -678,21 +679,17 @@ with tab_leads:
 # TAB 4: Metas por vendedor (ganados CRM vs metas.csv)
 # ─────────────────────────────────────────────
 with tab_metas:
-    hoy = date.today()
-    anio = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
-                        index=0, key="anio_metas")
-
     metas = load_metas()
-    won = load_won(anio, team_ids)
+    won = load_won(d1, d2, team_ids)
 
     if metas.empty:
         st.warning("No se encontró `metas.csv` en el repositorio. Crea el archivo con "
                    "columnas `vendedor,meta_anual` en la raíz del repo.")
     elif won.empty:
-        st.info(f"No hay oportunidades ganadas en {anio} para los filtros seleccionados.")
+        st.info("No hay oportunidades ganadas en el período seleccionado.")
     else:
-        # Meses transcurridos: si es el año actual, el mes en curso; si es un año pasado, 12
-        meses_transcurridos = hoy.month if anio == hoy.year else 12
+        # Meta del período = meta anual prorrateada por los días del rango del sidebar
+        dias_periodo = (date_to - date_from).days + 1
 
         ventas_vendedor = (won.groupby("vendedor", as_index=False)["expected_revenue"]
                            .sum().rename(columns={"expected_revenue": "vendido"}))
@@ -701,12 +698,12 @@ with tab_metas:
         cumpl = metas.merge(ventas_vendedor, on="vendedor", how="outer")
         cumpl["meta_anual"] = cumpl["meta_anual"].fillna(0)
         cumpl["vendido"] = cumpl["vendido"].fillna(0)
-        cumpl["meta_a_la_fecha"] = cumpl["meta_anual"] * meses_transcurridos / 12
-        cumpl["pct_a_la_fecha"] = cumpl.apply(
-            lambda r: r["vendido"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
+        cumpl["meta_periodo"] = cumpl["meta_anual"] * dias_periodo / 365.25
+        cumpl["pct_periodo"] = cumpl.apply(
+            lambda r: r["vendido"] / r["meta_periodo"] * 100 if r["meta_periodo"] else 0, axis=1)
         cumpl["pct_anual"] = cumpl.apply(
             lambda r: r["vendido"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
-        cumpl = cumpl.sort_values("pct_a_la_fecha", ascending=False)
+        cumpl = cumpl.sort_values("pct_periodo", ascending=False)
 
         sin_meta = cumpl[(cumpl["meta_anual"] == 0) & (cumpl["vendido"] > 0)]["vendedor"].tolist()
         if sin_meta:
@@ -717,27 +714,27 @@ with tab_metas:
 
         c1, c2, c3, c4 = st.columns(4)
         total_meta = con_meta["meta_anual"].sum()
-        total_meta_fecha = con_meta["meta_a_la_fecha"].sum()
+        total_meta_periodo = con_meta["meta_periodo"].sum()
         total_vendido = con_meta["vendido"].sum()
         c1.metric("Meta anual (equipo)", fmt_money(total_meta))
-        c2.metric(f"Meta a {hoy:%b} ({meses_transcurridos}/12)", fmt_money(total_meta_fecha))
+        c2.metric(f"Meta del período ({dias_periodo} días)", fmt_money(total_meta_periodo))
         c3.metric("Vendido (ganados)", fmt_money(total_vendido))
-        c4.metric("Cumplimiento a la fecha",
-                  f"{total_vendido / total_meta_fecha * 100:.1f}%" if total_meta_fecha else "—")
+        c4.metric("Cumplimiento del período",
+                  f"{total_vendido / total_meta_periodo * 100:.1f}%" if total_meta_periodo else "—")
 
         # Tabla de cumplimiento
-        tabla = con_meta[["vendedor", "meta_anual", "meta_a_la_fecha", "vendido",
-                          "pct_a_la_fecha", "pct_anual"]].copy()
+        tabla = con_meta[["vendedor", "meta_anual", "meta_periodo", "vendido",
+                          "pct_periodo", "pct_anual"]].copy()
         st.dataframe(
             tabla,
             use_container_width=True, hide_index=True,
             column_config={
                 "vendedor": "Vendedor",
                 "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
-                "meta_a_la_fecha": st.column_config.NumberColumn("Meta a la fecha", format="$%,.0f"),
+                "meta_periodo": st.column_config.NumberColumn("Meta del período", format="$%,.0f"),
                 "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
-                "pct_a_la_fecha": st.column_config.ProgressColumn(
-                    "% a la fecha", format="%.1f%%", min_value=0, max_value=150),
+                "pct_periodo": st.column_config.ProgressColumn(
+                    "% del período", format="%.1f%%", min_value=0, max_value=150),
                 "pct_anual": st.column_config.ProgressColumn(
                     "% anual", format="%.1f%%", min_value=0, max_value=100),
             },
@@ -747,13 +744,13 @@ with tab_metas:
         with col_a:
             comp = con_meta.melt(
                 id_vars="vendedor",
-                value_vars=["meta_a_la_fecha", "vendido"],
+                value_vars=["meta_periodo", "vendido"],
                 var_name="concepto", value_name="valor")
             comp["concepto"] = comp["concepto"].map(
-                {"meta_a_la_fecha": "Meta a la fecha", "vendido": "Vendido"})
+                {"meta_periodo": "Meta del período", "vendido": "Vendido"})
             fig = px.bar(comp, x="vendedor", y="valor", color="concepto",
-                         barmode="group", title="Vendido vs. meta a la fecha",
-                         color_discrete_map={"Meta a la fecha": "#9ca3af", "Vendido": "#1f77b4"},
+                         barmode="group", title="Vendido vs. meta del período",
+                         color_discrete_map={"Meta del período": "#9ca3af", "Vendido": "#1f77b4"},
                          labels={"valor": "COP", "vendedor": ""})
             st.plotly_chart(fig, use_container_width=True)
         with col_b:
@@ -773,20 +770,18 @@ with tab_metas:
 # TAB: Metas por línea (ganados CRM clasificados por etiqueta vs metas_lineas.csv)
 # ─────────────────────────────────────────────
 with tab_lineas:
-    anio_l = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
-                          index=0, key="anio_lineas")
-
     metas_lineas = load_metas_lineas()
-    won_lineas = load_won_lineas(anio_l, team_ids)
+    won_lineas = load_won_lineas(d1, d2, team_ids)
 
     if metas_lineas.empty:
         st.warning("No se encontró `data/metas_lineas.csv`. Crea el archivo con columnas "
                    "`linea,meta_anual` en la raíz del repo (el nombre de `linea` debe "
                    "coincidir EXACTAMENTE con la etiqueta configurada en Odoo CRM).")
     elif won_lineas.empty:
-        st.info(f"No hay oportunidades ganadas en {anio_l} para los filtros seleccionados.")
+        st.info("No hay oportunidades ganadas en el período seleccionado.")
     else:
-        meses_transcurridos_l = hoy.month if anio_l == hoy.year else 12
+        # Meta del período = meta anual prorrateada por los días del rango del sidebar
+        dias_periodo_l = (date_to - date_from).days + 1
 
         ventas_linea = (won_lineas.groupby("linea", as_index=False)["expected_revenue"]
                         .sum().rename(columns={"expected_revenue": "vendido"}))
@@ -794,12 +789,12 @@ with tab_lineas:
         cumpl_l = metas_lineas.merge(ventas_linea, on="linea", how="outer")
         cumpl_l["meta_anual"] = cumpl_l["meta_anual"].fillna(0)
         cumpl_l["vendido"] = cumpl_l["vendido"].fillna(0)
-        cumpl_l["meta_a_la_fecha"] = cumpl_l["meta_anual"] * meses_transcurridos_l / 12
-        cumpl_l["pct_a_la_fecha"] = cumpl_l.apply(
-            lambda r: r["vendido"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
+        cumpl_l["meta_periodo"] = cumpl_l["meta_anual"] * dias_periodo_l / 365.25
+        cumpl_l["pct_periodo"] = cumpl_l.apply(
+            lambda r: r["vendido"] / r["meta_periodo"] * 100 if r["meta_periodo"] else 0, axis=1)
         cumpl_l["pct_anual"] = cumpl_l.apply(
             lambda r: r["vendido"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
-        cumpl_l = cumpl_l.sort_values("pct_a_la_fecha", ascending=False)
+        cumpl_l = cumpl_l.sort_values("pct_periodo", ascending=False)
 
         sin_meta_l = cumpl_l[(cumpl_l["meta_anual"] == 0) & (cumpl_l["vendido"] > 0)]["linea"].tolist()
         if sin_meta_l:
@@ -810,26 +805,26 @@ with tab_lineas:
 
         c1, c2, c3, c4 = st.columns(4)
         total_meta_l = con_meta_l["meta_anual"].sum()
-        total_meta_fecha_l = con_meta_l["meta_a_la_fecha"].sum()
+        total_meta_periodo_l = con_meta_l["meta_periodo"].sum()
         total_vendido_l = con_meta_l["vendido"].sum()
         c1.metric("Meta anual (todas las líneas)", fmt_money(total_meta_l))
-        c2.metric(f"Meta a {hoy:%b} ({meses_transcurridos_l}/12)", fmt_money(total_meta_fecha_l))
+        c2.metric(f"Meta del período ({dias_periodo_l} días)", fmt_money(total_meta_periodo_l))
         c3.metric("Vendido (ganados)", fmt_money(total_vendido_l))
-        c4.metric("Cumplimiento a la fecha",
-                  f"{total_vendido_l / total_meta_fecha_l * 100:.1f}%" if total_meta_fecha_l else "—")
+        c4.metric("Cumplimiento del período",
+                  f"{total_vendido_l / total_meta_periodo_l * 100:.1f}%" if total_meta_periodo_l else "—")
 
-        tabla_l = con_meta_l[["linea", "meta_anual", "meta_a_la_fecha", "vendido",
-                              "pct_a_la_fecha", "pct_anual"]].copy()
+        tabla_l = con_meta_l[["linea", "meta_anual", "meta_periodo", "vendido",
+                              "pct_periodo", "pct_anual"]].copy()
         st.dataframe(
             tabla_l,
             use_container_width=True, hide_index=True,
             column_config={
                 "linea": "Línea",
                 "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
-                "meta_a_la_fecha": st.column_config.NumberColumn("Meta a la fecha", format="$%,.0f"),
+                "meta_periodo": st.column_config.NumberColumn("Meta del período", format="$%,.0f"),
                 "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
-                "pct_a_la_fecha": st.column_config.ProgressColumn(
-                    "% a la fecha", format="%.1f%%", min_value=0, max_value=150),
+                "pct_periodo": st.column_config.ProgressColumn(
+                    "% del período", format="%.1f%%", min_value=0, max_value=150),
                 "pct_anual": st.column_config.ProgressColumn(
                     "% anual", format="%.1f%%", min_value=0, max_value=100),
             },
@@ -839,13 +834,13 @@ with tab_lineas:
         with col_a:
             comp_l = con_meta_l.melt(
                 id_vars="linea",
-                value_vars=["meta_a_la_fecha", "vendido"],
+                value_vars=["meta_periodo", "vendido"],
                 var_name="concepto", value_name="valor")
             comp_l["concepto"] = comp_l["concepto"].map(
-                {"meta_a_la_fecha": "Meta a la fecha", "vendido": "Vendido"})
+                {"meta_periodo": "Meta del período", "vendido": "Vendido"})
             fig = px.bar(comp_l, x="linea", y="valor", color="concepto",
-                         barmode="group", title="Vendido vs. meta a la fecha por línea",
-                         color_discrete_map={"Meta a la fecha": "#9ca3af", "Vendido": "#1f77b4"},
+                         barmode="group", title="Vendido vs. meta del período por línea",
+                         color_discrete_map={"Meta del período": "#9ca3af", "Vendido": "#1f77b4"},
                          labels={"valor": "COP", "linea": ""})
             st.plotly_chart(fig, use_container_width=True)
         with col_b:
