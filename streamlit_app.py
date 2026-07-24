@@ -825,6 +825,18 @@ with tab_lineas:
                          labels={"expected_revenue": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
+        st.markdown("#### Ganado por mes y vendedor, por línea")
+        for linea_nombre in con_meta_l["linea"]:
+            datos_linea = won_lineas[won_lineas["linea"] == linea_nombre]
+            if datos_linea.empty:
+                continue
+            mensual_linea_vendedor = (datos_linea.groupby(["mes", "vendedor"], as_index=False)
+                                      ["expected_revenue"].sum())
+            fig = px.bar(mensual_linea_vendedor, x="mes", y="expected_revenue", color="vendedor",
+                         barmode="group", title=f"{linea_nombre} — ganado por mes y vendedor",
+                         labels={"expected_revenue": "COP", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
         with st.expander("📋 Detalle de oportunidades ganadas por línea"):
             st.dataframe(
                 won_lineas[["name", "date_closed", "vendedor", "equipo", "linea", "expected_revenue"]],
