@@ -129,15 +129,26 @@ def load_all_invoices(team_ids: list[int]) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando facturación de Soporte...")
-def load_soporte_lines(team_ids: list[int]) -> pd.DataFrame:
-    """TODO el historial de líneas de factura de la categoría de producto
-    'Soporte' (sin límite de fecha), para poder saber desde cuándo se le
-    factura soporte/mantenimiento a cada cliente."""
+# Mapeo línea de negocio → categoría de producto en Odoo, usado para clasificar
+# las líneas de factura (no existe un tag_ids en account.move como en crm.lead).
+LINEA_CATEGORIA = {
+    "Implementación Odoo": "Transformación digital",
+    "Soporte y Mantenimiento": "Soporte",
+    "Licenciamiento": "Licenciamiento",
+}
+MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
+def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int]) -> pd.DataFrame:
+    """TODO el historial de líneas de factura de una categoría de producto dada
+    (sin límite de fecha), para poder clasificar la facturación por línea de
+    negocio y saber desde cuándo se le factura a cada cliente."""
     domain = [
         ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
         ("move_id.state", "=", "posted"),
-        ("product_id.categ_id.name", "=", "Soporte"),
+        ("product_id.categ_id.name", "=", categoria),
     ]
     if team_ids:
         domain.append(("move_id.team_id", "in", team_ids))
@@ -306,6 +317,75 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
         lambda ids: [tag_names.get(i, "Sin etiqueta") for i in ids] if ids else ["Sin etiqueta"])
     df = df.explode("linea")
     return df[cols]
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando cumplimiento mensual por línea...")
+def load_cumplimiento_mensual(year: int, team_ids: list[int]) -> pd.DataFrame:
+    """Vendido (CRM ganado) y Facturado, por línea de negocio y mes, para el año
+    dado. Una fila por (línea, mes) con columnas 'vendido' y 'facturado';
+    incluye los 12 meses aunque no haya movimiento (quedan en 0)."""
+    won = load_won_lineas(f"{year}-01-01", f"{year}-12-31", team_ids)
+    if not won.empty:
+        vendido = (won.groupby(["linea", "mes"], as_index=False)["expected_revenue"]
+                   .sum().rename(columns={"expected_revenue": "vendido"}))
+    else:
+        vendido = pd.DataFrame(columns=["linea", "mes", "vendido"])
+
+    partes = []
+    for linea, categoria in LINEA_CATEGORIA.items():
+        lineas_fact = load_invoice_lines_by_categoria(categoria, team_ids)
+        if lineas_fact.empty:
+            continue
+        lineas_fact = lineas_fact[lineas_fact["date"].dt.year == year]
+        if lineas_fact.empty:
+            continue
+        resumen = (lineas_fact.groupby("mes", as_index=False)["monto"]
+                  .sum().rename(columns={"monto": "facturado"}))
+        resumen["linea"] = linea
+        partes.append(resumen)
+    facturado = (pd.concat(partes, ignore_index=True) if partes
+                else pd.DataFrame(columns=["mes", "facturado", "linea"]))
+
+    meses = [f"{year}-{m:02d}" for m in range(1, 13)]
+    base = pd.MultiIndex.from_product(
+        [list(LINEA_CATEGORIA.keys()), meses], names=["linea", "mes"]).to_frame(index=False)
+    tabla = base.merge(vendido, on=["linea", "mes"], how="left")
+    tabla = tabla.merge(facturado, on=["linea", "mes"], how="left")
+    tabla["vendido"] = tabla["vendido"].fillna(0)
+    tabla["facturado"] = tabla["facturado"].fillna(0)
+    return tabla
+
+
+def construir_pivote_cumplimiento(datos: pd.DataFrame, value_col: str, year: int,
+                                   metas_lineas: pd.DataFrame) -> pd.DataFrame:
+    """Matriz línea (filas, + TOTAL) x mes (columnas, + Acumulado + % Cumpl.
+    Anual), al estilo del reporte de referencia en Excel/Sheets."""
+    filas = []
+    for linea in LINEA_CATEGORIA:
+        meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
+        meta_anual = float(meta_row.iloc[0]) if not meta_row.empty else 0.0
+        fila = {"Línea": linea}
+        acumulado = 0.0
+        for m, nombre_mes in enumerate(MESES_ES, start=1):
+            mes_key = f"{year}-{m:02d}"
+            valor = datos.loc[
+                (datos["linea"] == linea) & (datos["mes"] == mes_key), value_col].sum()
+            fila[nombre_mes] = valor
+            acumulado += valor
+        fila["Acumulado"] = acumulado
+        fila["% Cumpl. Anual"] = (acumulado / meta_anual * 100) if meta_anual else 0.0
+        fila["_meta_anual"] = meta_anual
+        filas.append(fila)
+
+    tabla = pd.DataFrame(filas)
+    total = {"Línea": "TOTAL"}
+    for nombre_mes in MESES_ES:
+        total[nombre_mes] = tabla[nombre_mes].sum()
+    total["Acumulado"] = tabla["Acumulado"].sum()
+    meta_total = tabla["_meta_anual"].sum()
+    total["% Cumpl. Anual"] = (total["Acumulado"] / meta_total * 100) if meta_total else 0.0
+    tabla = tabla.drop(columns="_meta_anual")
+    return pd.concat([tabla, pd.DataFrame([total])], ignore_index=True)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando leads y pipeline completo...")
@@ -530,6 +610,121 @@ with tab_fact:
                 invoices[["name", "invoice_date", "cliente", "vendedor", "equipo",
                           "amount_total_signed", "amount_residual_signed", "payment_state"]],
                 use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    st.markdown("### 🎯 Cumplimiento Meta vs. Vendido vs. Facturado por línea de negocio")
+    st.caption("Esta sección usa un año calendario completo (no el rango de fechas del "
+              "sidebar), para poder comparar los 12 meses a la vez, igual que el reporte "
+              "de referencia en Excel/Sheets.")
+
+    anio_cumpl = st.selectbox("Año a analizar", options=range(hoy.year, hoy.year - 4, -1),
+                              index=0, key="anio_cumplimiento_lineas")
+    metas_lineas_cumpl = load_metas_lineas()
+
+    if metas_lineas_cumpl.empty:
+        st.warning("No se encontró `data/metas_lineas.csv` con las metas por línea.")
+    else:
+        datos_cumpl = load_cumplimiento_mensual(anio_cumpl, team_ids)
+        meta_mensual_por_linea = metas_lineas_cumpl.set_index("linea")["meta_anual"] / 12
+        datos_cumpl["meta_mensual"] = datos_cumpl["linea"].map(meta_mensual_por_linea).fillna(0)
+        datos_cumpl["diferencia"] = datos_cumpl["facturado"] - datos_cumpl["meta_mensual"]
+
+        meta_anual_total = metas_lineas_cumpl["meta_anual"].sum()
+        vendido_total = datos_cumpl["vendido"].sum()
+        facturado_total = datos_cumpl["facturado"].sum()
+        pct_anual_total = (facturado_total / meta_anual_total * 100) if meta_anual_total else 0
+        diferencia_total = facturado_total - meta_anual_total
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Meta anual (3 líneas)", fmt_money(meta_anual_total))
+        c2.metric("Vendido acumulado", fmt_money(vendido_total))
+        c3.metric("Facturado acumulado", fmt_money(facturado_total))
+        c4.metric("% cumplimiento anual", f"{pct_anual_total:.1f}%")
+        c5.metric("Diferencia vs. meta anual", fmt_money(diferencia_total))
+
+        with st.expander("📌 Metas anuales y mensuales por línea"):
+            ref = metas_lineas_cumpl[metas_lineas_cumpl["linea"].isin(LINEA_CATEGORIA)].copy()
+            ref["meta_mensual"] = ref["meta_anual"] / 12
+            st.dataframe(
+                ref[["linea", "meta_anual", "meta_mensual"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "linea": "Línea",
+                    "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
+                    "meta_mensual": st.column_config.NumberColumn("Meta mensual", format="$%,.0f"),
+                },
+            )
+
+        consolidado_mensual = datos_cumpl.groupby("mes", as_index=False)[["vendido", "facturado"]].sum()
+        consolidado_mensual["meta"] = meta_anual_total / 12
+        consolidado_largo = consolidado_mensual.melt(
+            id_vars="mes", value_vars=["meta", "vendido", "facturado"],
+            var_name="concepto", value_name="valor")
+        consolidado_largo["concepto"] = consolidado_largo["concepto"].map(
+            {"meta": "Meta mensual", "vendido": "Vendido", "facturado": "Facturado"})
+        fig = px.bar(consolidado_largo, x="mes", y="valor", color="concepto", barmode="group",
+                     title="Meta vs. Vendido vs. Facturado por mes (consolidado, 3 líneas)",
+                     color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#f5a623",
+                                         "Facturado": "#1f77b4"},
+                     labels={"valor": "COP", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        fig = px.bar(datos_cumpl, x="mes", y="facturado", color="linea", barmode="group",
+                     title="Facturado por mes y línea de negocio",
+                     labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        col_config_pivote = {"Línea": "Línea"}
+        for m in MESES_ES:
+            col_config_pivote[m] = st.column_config.NumberColumn(m, format="$%,.0f")
+        col_config_pivote["Acumulado"] = st.column_config.NumberColumn("Acumulado", format="$%,.0f")
+        col_config_pivote["% Cumpl. Anual"] = st.column_config.ProgressColumn(
+            "% Cumpl. Anual", format="%.1f%%", min_value=0, max_value=150)
+
+        st.markdown("#### 📈 Ventas (CRM ganado) por línea y mes")
+        pivote_ventas = construir_pivote_cumplimiento(datos_cumpl, "vendido", anio_cumpl, metas_lineas_cumpl)
+        st.dataframe(pivote_ventas, use_container_width=True, hide_index=True,
+                     column_config=col_config_pivote)
+
+        st.markdown("#### 🧾 Facturado por línea y mes")
+        pivote_facturado = construir_pivote_cumplimiento(datos_cumpl, "facturado", anio_cumpl, metas_lineas_cumpl)
+        st.dataframe(pivote_facturado, use_container_width=True, hide_index=True,
+                     column_config=col_config_pivote)
+
+        st.markdown("#### ↕️ Diferencia mensual: Facturado vs. Meta, por línea")
+        col_config_dif = {"Línea": "Línea"}
+        for m in MESES_ES:
+            col_config_dif[m] = st.column_config.NumberColumn(m, format="$%,.0f")
+        col_config_dif["Acumulado"] = st.column_config.NumberColumn("Acumulado", format="$%,.0f")
+        col_config_dif["% Cumpl. Anual"] = st.column_config.NumberColumn(
+            "% variación vs. meta anual", format="%.1f%%")
+        pivote_dif = construir_pivote_cumplimiento(datos_cumpl, "diferencia", anio_cumpl, metas_lineas_cumpl)
+        st.dataframe(pivote_dif, use_container_width=True, hide_index=True,
+                     column_config=col_config_dif)
+
+        with st.expander("📋 Detalle mensual por línea (datos crudos)"):
+            detalle = datos_cumpl.copy()
+            detalle["pct_cumpl_venta"] = detalle.apply(
+                lambda r: r["vendido"] / r["meta_mensual"] * 100 if r["meta_mensual"] else 0, axis=1)
+            detalle["pct_cumpl_factura"] = detalle.apply(
+                lambda r: r["facturado"] / r["meta_mensual"] * 100 if r["meta_mensual"] else 0, axis=1)
+            st.dataframe(
+                detalle[["linea", "mes", "meta_mensual", "vendido", "facturado",
+                        "pct_cumpl_venta", "pct_cumpl_factura", "diferencia"]]
+                    .sort_values(["linea", "mes"]),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "linea": "Línea", "mes": "Mes",
+                    "meta_mensual": st.column_config.NumberColumn("Meta mensual", format="$%,.0f"),
+                    "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                    "facturado": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    "pct_cumpl_venta": st.column_config.ProgressColumn(
+                        "% Cumpl. Venta", format="%.1f%%", min_value=0, max_value=150),
+                    "pct_cumpl_factura": st.column_config.ProgressColumn(
+                        "% Cumpl. Factura", format="%.1f%%", min_value=0, max_value=150),
+                    "diferencia": st.column_config.NumberColumn("Diferencia", format="$%,.0f"),
+                },
             )
 
 # ─────────────────────────────────────────────
@@ -979,7 +1174,7 @@ with tab_clientes:
 # TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
 # ─────────────────────────────────────────────
 with tab_soporte:
-    soporte_lines = load_soporte_lines(team_ids)
+    soporte_lines = load_invoice_lines_by_categoria(LINEA_CATEGORIA["Soporte y Mantenimiento"], team_ids)
 
     if soporte_lines.empty:
         st.info("No hay facturación de la categoría 'Soporte' en el historial.")
