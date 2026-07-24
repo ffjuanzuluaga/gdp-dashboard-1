@@ -105,6 +105,28 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     return df
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando historial completo de clientes...")
+def load_all_sales(team_ids: list[int]) -> pd.DataFrame:
+    """TODO el historial de órdenes confirmadas (sin límite de fecha), para poder
+    saber el año de la primera compra de cada cliente y así distinguir clientes
+    nuevos de recurrentes, sin importar el rango de fechas del sidebar."""
+    domain = [("state", "in", ["sale", "done"])]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "sale.order", domain,
+        ["date_order", "partner_id", "amount_total"],
+        order="date_order",
+    )
+    if df.empty:
+        return df
+    df["date_order"] = pd.to_datetime(df["date_order"])
+    df["anio"] = df["date_order"].dt.year
+    df["cliente_id"] = m2o_id(df["partner_id"])
+    df["cliente"] = m2o_name(df["partner_id"])
+    return df
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     domain = [
@@ -363,9 +385,9 @@ st.title("📊 Dashboard Comercial")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas = st.tabs(
+tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes = st.tabs(
     ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "📨 Leads y Conversión",
-     "🏆 Metas por vendedor", "🏷️ Metas por línea"]
+     "🏆 Metas por vendedor", "🏷️ Metas por línea", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes"]
 )
 
 # ─────────────────────────────────────────────
@@ -805,3 +827,83 @@ with tab_lineas:
                 won_lineas[["name", "date_closed", "vendedor", "equipo", "linea", "expected_revenue"]],
                 use_container_width=True, hide_index=True,
             )
+
+# ─────────────────────────────────────────────
+# TAB: Clientes Nuevos vs. Recurrentes
+# ─────────────────────────────────────────────
+with tab_clientes:
+    anio_c = st.selectbox("Año a evaluar", options=range(hoy.year, hoy.year - 4, -1),
+                          index=0, key="anio_clientes")
+
+    all_sales = load_all_sales(team_ids)
+
+    if all_sales.empty:
+        st.info("No hay órdenes de venta confirmadas en el historial.")
+    else:
+        # Año de la primera compra histórica de cada cliente (sin límite de fecha)
+        primera_compra = (all_sales.groupby("cliente_id")["anio"].min()
+                          .rename("anio_primera_compra"))
+
+        ventas_anio = all_sales[all_sales["anio"] == anio_c]
+        if ventas_anio.empty:
+            st.info(f"No hay órdenes de venta confirmadas en {anio_c} para los filtros seleccionados.")
+        else:
+            resumen = (ventas_anio.groupby(["cliente_id", "cliente"], as_index=False)["amount_total"]
+                      .sum())
+            resumen = resumen.merge(primera_compra, on="cliente_id", how="left")
+            resumen["segmento"] = resumen["anio_primera_compra"].apply(
+                lambda y: "Nuevo" if y == anio_c else "Recurrente")
+
+            nuevos = resumen[resumen["segmento"] == "Nuevo"]
+            recurrentes = resumen[resumen["segmento"] == "Recurrente"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Clientes activos", len(resumen))
+            c2.metric("Clientes nuevos", len(nuevos))
+            c3.metric("Clientes recurrentes", len(recurrentes))
+            c4.metric("% clientes nuevos",
+                      f"{len(nuevos) / len(resumen) * 100:.1f}%" if len(resumen) else "—")
+            st.caption(f"\"Nuevo\" = su primera compra registrada (en todo el historial) fue en "
+                      f"{anio_c}. \"Recurrente\" = ya había comprado en algún año anterior y "
+                      f"volvió a comprar en {anio_c}.")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                conteo = resumen["segmento"].value_counts().reset_index()
+                conteo.columns = ["segmento", "clientes"]
+                fig = px.pie(conteo, names="segmento", values="clientes",
+                            title="Clientes: nuevos vs. recurrentes", hole=0.45,
+                            color="segmento",
+                            color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
+                st.plotly_chart(fig, use_container_width=True)
+            with col_b:
+                ventas_seg = resumen.groupby("segmento", as_index=False)["amount_total"].sum()
+                fig = px.pie(ventas_seg, names="segmento", values="amount_total",
+                            title="Ventas del año: nuevos vs. recurrentes", hole=0.45,
+                            color="segmento",
+                            color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
+                st.plotly_chart(fig, use_container_width=True)
+
+            with st.expander(f"📋 Clientes NUEVOS en {anio_c} ({len(nuevos)})"):
+                st.dataframe(
+                    nuevos[["cliente", "amount_total"]].sort_values("amount_total", ascending=False),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "cliente": "Cliente",
+                        "amount_total": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                    },
+                )
+            with st.expander(f"📋 Clientes RECURRENTES en {anio_c} ({len(recurrentes)})"):
+                recurrentes_tabla = recurrentes.copy()
+                recurrentes_tabla["antiguedad_anios"] = anio_c - recurrentes_tabla["anio_primera_compra"]
+                st.dataframe(
+                    recurrentes_tabla[["cliente", "anio_primera_compra", "antiguedad_anios",
+                                       "amount_total"]].sort_values("amount_total", ascending=False),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "cliente": "Cliente",
+                        "anio_primera_compra": "Cliente desde",
+                        "antiguedad_anios": "Antigüedad (años)",
+                        "amount_total": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                    },
+                )
