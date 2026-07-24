@@ -5,6 +5,7 @@ Modelos: sale.order, account.move, crm.lead — segmentado por equipos de ventas
 Pensado para desplegarse en Streamlit Community Cloud (share.streamlit.io).
 """
 
+import threading
 import xmlrpc.client
 from datetime import date, datetime, timedelta
 
@@ -24,12 +25,21 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 # Conexión a Odoo (XML-RPC)
 # ─────────────────────────────────────────────
+# get_connection() se cachea con cache_resource → el mismo ServerProxy (y su
+# conexión HTTP persistente) se comparte entre TODAS las sesiones de usuario.
+# xmlrpc.client no es thread-safe sobre una conexión compartida, así que hay
+# que serializar las llamadas con un lock para evitar http.client.ResponseNotReady
+# cuando dos peticiones concurrentes reutilizan el mismo socket.
+_odoo_lock = threading.Lock()
+
+
 @st.cache_resource(show_spinner="Conectando con Odoo...")
 def get_connection():
     """Autentica una sola vez y reutiliza la conexión en toda la sesión."""
     cfg = st.secrets["odoo"]
     common = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/common", allow_none=True)
-    uid = common.authenticate(cfg["db"], cfg["username"], cfg["api_key"], {})
+    with _odoo_lock:
+        uid = common.authenticate(cfg["db"], cfg["username"], cfg["api_key"], {})
     if not uid:
         st.error("❌ Autenticación fallida. Verifica url, db, username y api_key en los Secrets.")
         st.stop()
@@ -39,9 +49,10 @@ def get_connection():
 
 def odoo_call(model: str, method: str, args: list, kwargs: dict | None = None):
     cfg, uid, models = get_connection()
-    return models.execute_kw(
-        cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {}
-    )
+    with _odoo_lock:
+        return models.execute_kw(
+            cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {}
+        )
 
 
 def search_read(model: str, domain: list, fields: list, **kw) -> pd.DataFrame:
