@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Dashboard comercial conectado a Odoo 19 vía XML-RPC.
-Modelos: sale.order, account.move, crm.lead — segmentado por equipos de ventas (crm.team).
+Dashboard comercial de la línea de Transformación Digital, conectado a Odoo 19 vía
+XML-RPC. Toda la base de datos (sale.order, account.move, crm.lead) pertenece a esta
+línea; el filtro de "equipos de venta" (crm.team) es solo para desglosar entre
+sub-equipos/vendedores de TD, no para separarla de otras líneas de negocio.
 Pensado para desplegarse en Streamlit Community Cloud (share.streamlit.io).
 """
 
@@ -17,7 +19,7 @@ import streamlit as st
 # Configuración de página
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Dashboard Comercial · Odoo 19",
+    page_title="Dashboard Transformación Digital · Odoo 19",
     page_icon="📊",
     layout="wide",
 )
@@ -494,15 +496,122 @@ leads = load_leads(d1, d2, team_ids)
 leads_full = load_leads_full(d1, d2, team_ids)
 closed = load_pipeline_closed(d1, d2, team_ids)
 
-st.title("📊 Dashboard Comercial")
+st.title("📊 Dashboard Transformación Digital")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
 
-tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes, tab_soporte = st.tabs(
-    ["🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline", "📨 Leads y Conversión",
-     "🏆 Metas por vendedor", "🏷️ Metas por línea", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes",
-     "🛠️ Soporte y Mantenimiento"]
+tab_td, tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes, tab_soporte = st.tabs(
+    ["🏠 Resumen Ejecutivo", "🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline",
+     "📨 Leads y Conversión", "🏆 Metas por vendedor", "🏷️ Metas por línea",
+     "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes", "🛠️ Soporte y Mantenimiento"]
 )
+
+# ─────────────────────────────────────────────
+# TAB: Resumen Ejecutivo (KPIs consolidados de la línea)
+# ─────────────────────────────────────────────
+with tab_td:
+    st.caption("Resumen ejecutivo consolidado: Proyectos (Implementación Odoo), Soporte "
+               "y Licenciamiento — los tres tipos de ingreso de la línea. Esta pestaña NO "
+               "usa el rango de fechas del sidebar: el año se elige abajo, y el 'mes "
+               "actual' es siempre el mes calendario de hoy.")
+
+    anio_td = st.selectbox("Año a analizar", options=range(hoy.year, hoy.year - 4, -1),
+                           index=0, key="anio_td")
+    metas_lineas_td = load_metas_lineas()
+
+    if metas_lineas_td.empty:
+        st.warning("No se encontró `data/metas_lineas.csv` con las metas por línea.")
+    else:
+        datos_td = load_cumplimiento_mensual(anio_td, team_ids)
+        meta_anual_td = metas_lineas_td["meta_anual"].sum()
+        vendido_anual_td = datos_td["vendido"].sum()
+        facturado_anual_td = datos_td["facturado"].sum()
+        pct_anual_td = (facturado_anual_td / meta_anual_td * 100) if meta_anual_td else 0
+
+        st.markdown("#### 🎯 Resumen del año")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Meta de ventas año", fmt_money(meta_anual_td))
+        c2.metric("Ventas acumuladas del año", fmt_money(vendido_anual_td))
+        c3.metric("Facturación acumulada del año", fmt_money(facturado_anual_td))
+        c4.metric("% cumplimiento anual", f"{pct_anual_td:.1f}%")
+
+        if anio_td == hoy.year:
+            st.markdown("#### 📅 Mes actual")
+            mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
+            won_mes = load_won_lineas(hoy.replace(day=1).isoformat(), hoy.isoformat(), team_ids)
+            won_mes_td = won_mes[won_mes["linea"].isin(LINEA_CATEGORIA)]
+            ventas_mes = won_mes_td["expected_revenue"].sum()
+            ticket_prom_mes = won_mes_td["expected_revenue"].mean() if not won_mes_td.empty else 0
+            fact_mes = datos_td.loc[datos_td["mes"] == mes_actual_key, "facturado"].sum()
+
+            c5, c6, c7 = st.columns(3)
+            c5.metric("Ventas del mes", fmt_money(ventas_mes))
+            c6.metric("Facturación del mes", fmt_money(fact_mes))
+            c7.metric("Ticket promedio de venta", fmt_money(ticket_prom_mes) if ticket_prom_mes else "—")
+        else:
+            st.caption(f"La sección de 'mes actual' solo aplica al año en curso ({hoy.year}).")
+
+        st.divider()
+        st.markdown("#### 📈 Proyectos y contratos de soporte vendidos — últimos 12 meses")
+        st.caption("Cantidad de oportunidades GANADAS por mes, según etiqueta de línea "
+                   "(no depende del año seleccionado arriba).")
+
+        desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
+        won_12m = load_won_lineas(desde_12m.isoformat(), hoy.isoformat(), team_ids)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            proyectos_12m = won_12m[won_12m["linea"] == "Implementación Odoo"] if not won_12m.empty else won_12m
+            if proyectos_12m.empty:
+                st.info("No hay proyectos ganados en los últimos 12 meses.")
+            else:
+                conteo = (proyectos_12m.groupby("mes", as_index=False)
+                          .agg(proyectos=("name", "count")))
+                fig = px.bar(conteo, x="mes", y="proyectos", text_auto=True,
+                             title="Proyectos vendidos por mes",
+                             labels={"proyectos": "Proyectos", "mes": "Mes"})
+                st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            soporte_12m = won_12m[won_12m["linea"] == "Soporte y Mantenimiento"] if not won_12m.empty else won_12m
+            if soporte_12m.empty:
+                st.info("No hay contratos de soporte ganados en los últimos 12 meses.")
+            else:
+                conteo_s = (soporte_12m.groupby("mes", as_index=False)
+                            .agg(contratos=("name", "count")))
+                fig = px.bar(conteo_s, x="mes", y="contratos", text_auto=True,
+                             title="Contratos de soporte vendidos por mes",
+                             labels={"contratos": "Contratos", "mes": "Mes"})
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### 🧾 Facturación mensual por tipo (Proyectos / Soporte / Licenciamiento)")
+        fig = px.bar(datos_td, x="mes", y="facturado", color="linea", barmode="group",
+                     title=f"Facturado por mes y línea — {anio_td}",
+                     labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### 🏆 Meta del año y total facturado por tipo")
+        resumen_tipo = metas_lineas_td.merge(
+            datos_td.groupby("linea", as_index=False)["facturado"].sum(),
+            on="linea", how="left")
+        resumen_tipo["facturado"] = resumen_tipo["facturado"].fillna(0)
+        resumen_tipo["pct"] = resumen_tipo.apply(
+            lambda r: r["facturado"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
+        st.dataframe(
+            resumen_tipo, use_container_width=True, hide_index=True,
+            column_config={
+                "linea": "Línea",
+                "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
+                "facturado": st.column_config.NumberColumn("Total facturado", format="$%,.0f"),
+                "pct": st.column_config.ProgressColumn("% cumplimiento", format="%.1f%%",
+                                                        min_value=0, max_value=150),
+            },
+        )
+
+        st.caption("🔜 Próxima fase: contratos de soporte activos y meta de contratos en "
+                  "número (requiere conectar los campos de `support_contract` en Odoo) y "
+                  "rentabilidad por línea (requiere definir el etiquetado de costos por "
+                  "línea en la contabilidad analítica).")
 
 # ─────────────────────────────────────────────
 # TAB 1: Ventas (sale.order)
