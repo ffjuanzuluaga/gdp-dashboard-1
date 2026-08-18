@@ -503,11 +503,11 @@ def load_sold_hours_lines(date_from: str, date_to: str, team_ids: list[int]):
         ("order_id.date_order", ">=", date_from),
         ("order_id.date_order", "<=", f"{date_to} 23:59:59"),
         ("order_id.state", "in", ["sale", "done"]),
-        ("product_uom.name", "ilike", "hora"),
+        ("product_uom_id.name", "ilike", "hora"),
     ]
     if team_ids:
         domain.append(("order_id.team_id", "in", team_ids))
-    cols = ["order_id", "product_uom_qty", "product_uom"]
+    cols = ["order_id", "product_uom_qty", "product_uom_id"]
     try:
         df = search_read("sale.order.line", domain, cols)
     except Exception as e:
