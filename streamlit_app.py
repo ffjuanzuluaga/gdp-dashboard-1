@@ -34,29 +34,35 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 # get_connection() se cachea con cache_resource → el mismo ServerProxy (y su
 # conexión HTTP persistente) se comparte entre TODAS las sesiones de usuario.
-# xmlrpc.client no es thread-safe sobre una conexión compartida, así que hay
-# que serializar las llamadas con un lock para evitar http.client.ResponseNotReady
-# cuando dos peticiones concurrentes reutilizan el mismo socket.
-_odoo_lock = threading.Lock()
-
-
+# xmlrpc.client no es thread-safe sobre una conexión compartida, así que hay que
+# serializar las llamadas con un lock para evitar http.client.CannotSendRequest /
+# ResponseNotReady cuando dos peticiones concurrentes reutilizan el mismo socket.
+#
+# OJO: el lock se crea DENTRO de get_connection() (y se cachea junto con la
+# conexión) en vez de como variable global de módulo (`_odoo_lock = Lock()`
+# suelto), porque Streamlit re-ejecuta el script en un namespace NUEVO en cada
+# rerun (de cualquier sesión) — una variable global normal se recrearía en cada
+# rerun y dejaría de ser el mismo objeto entre sesiones concurrentes, con lo que
+# el lock no bloquearía nada de verdad. Solo lo que pasa por cache_resource /
+# cache_data persiste de verdad entre reruns y sesiones.
 @st.cache_resource(show_spinner="Conectando con Odoo...")
 def get_connection():
-    """Autentica una sola vez y reutiliza la conexión en toda la sesión."""
+    """Autentica una sola vez y reutiliza la conexión (y su lock) en toda la app."""
     cfg = st.secrets["odoo"]
     common = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/common", allow_none=True)
-    with _odoo_lock:
+    lock = threading.Lock()
+    with lock:
         uid = common.authenticate(cfg["db"], cfg["username"], cfg["api_key"], {})
     if not uid:
         st.error("❌ Autenticación fallida. Verifica url, db, username y api_key en los Secrets.")
         st.stop()
     models = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/object", allow_none=True)
-    return cfg, uid, models
+    return cfg, uid, models, lock
 
 
 def odoo_call(model: str, method: str, args: list, kwargs: dict | None = None):
-    cfg, uid, models = get_connection()
-    with _odoo_lock:
+    cfg, uid, models, lock = get_connection()
+    with lock:
         return models.execute_kw(
             cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {}
         )
@@ -667,6 +673,12 @@ def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
 
+def fmt_miles_apostrofe(v: float) -> str:
+    """Valor en miles de pesos, con apóstrofe como separador (p. ej. 40'463 para
+    $40.463.000), al estilo de notación informal colombiana."""
+    return f"{v / 1000:,.0f}".replace(",", "'")
+
+
 # ─────────────────────────────────────────────
 # Sidebar: filtros globales
 # ─────────────────────────────────────────────
@@ -820,7 +832,8 @@ with tab_td:
         st.divider()
         st.markdown("#### 📈 Proyectos y contratos de soporte vendidos — últimos 12 meses")
         st.caption("Cantidad de oportunidades GANADAS por mes, según etiqueta de línea "
-                   "(no depende del año seleccionado arriba).")
+                   "(no depende del año seleccionado arriba). La etiqueta de cada barra "
+                   "muestra Cantidad / Valor vendido (en miles de pesos).")
 
         desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
         won_12m = load_won_lineas(desde_12m.isoformat(), hoy.isoformat(), team_ids)
@@ -832,10 +845,14 @@ with tab_td:
                 st.info("No hay proyectos ganados en los últimos 12 meses.")
             else:
                 conteo = (proyectos_12m.groupby("mes", as_index=False)
-                          .agg(proyectos=("name", "count")))
-                fig = px.bar(conteo, x="mes", y="proyectos", text_auto=True,
+                          .agg(proyectos=("name", "count"),
+                               valor=("expected_revenue", "sum")))
+                conteo["etiqueta"] = conteo.apply(
+                    lambda r: f"{r['proyectos']}/ {fmt_miles_apostrofe(r['valor'])}", axis=1)
+                fig = px.bar(conteo, x="mes", y="proyectos", text="etiqueta",
                              title="Proyectos vendidos por mes",
                              labels={"proyectos": "Proyectos", "mes": "Mes"})
+                fig.update_traces(textposition="outside")
                 st.plotly_chart(fig, use_container_width=True)
         with col_b:
             soporte_12m = won_12m[won_12m["linea"] == "Soporte y Mantenimiento"] if not won_12m.empty else won_12m
@@ -843,10 +860,14 @@ with tab_td:
                 st.info("No hay contratos de soporte ganados en los últimos 12 meses.")
             else:
                 conteo_s = (soporte_12m.groupby("mes", as_index=False)
-                            .agg(contratos=("name", "count")))
-                fig = px.bar(conteo_s, x="mes", y="contratos", text_auto=True,
+                            .agg(contratos=("name", "count"),
+                                 valor=("expected_revenue", "sum")))
+                conteo_s["etiqueta"] = conteo_s.apply(
+                    lambda r: f"{r['contratos']}/ {fmt_miles_apostrofe(r['valor'])}", axis=1)
+                fig = px.bar(conteo_s, x="mes", y="contratos", text="etiqueta",
                              title="Contratos de soporte vendidos por mes",
                              labels={"contratos": "Contratos", "mes": "Mes"})
+                fig.update_traces(textposition="outside")
                 st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
