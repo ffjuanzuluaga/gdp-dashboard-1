@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Dashboard comercial de la línea de Transformación Digital, conectado a Odoo 19 vía
-XML-RPC. Toda la base de datos (sale.order, account.move, crm.lead) pertenece a esta
-línea; el filtro de "equipos de venta" (crm.team) es solo para desglosar entre
-sub-equipos/vendedores de TD, no para separarla de otras líneas de negocio.
+XML-RPC. El mismo Odoo aloja otras líneas de negocio de Firefly (p. ej. nómina/BPO),
+así que el dashboard se restringe SIEMPRE al equipo de ventas "Transformación
+Digital" (crm.team) para sale.order, account.move y crm.lead; el multiselect de
+"equipos de venta" del sidebar solo sirve para desglosar entre sub-equipos DENTRO de
+esa línea, nunca para incluir equipos de otras líneas. Los costos analíticos
+(pestaña Rentabilidad) se identifican por nombre de cuenta analítica en Odoo, ya
+que account.analytic.line no tiene equipo de ventas (ver LINEA_CUENTA_ANALITICA).
 Pensado para desplegarse en Streamlit Community Cloud (share.streamlit.io).
 """
 
 import threading
+import unicodedata
 import xmlrpc.client
 from datetime import date, datetime, timedelta
 
@@ -74,6 +79,18 @@ def m2o_id(series: pd.Series) -> pd.Series:
     return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
 
 
+def _normalizar(s: str) -> str:
+    """Mayúsculas y sin tildes, para comparar nombres de Odoo sin depender de
+    cómo se hayan tildado/capitalizado (p. ej. 'Transformación Digital' vs.
+    'TRANSFORMACION DIGITAL')."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").upper().strip()
+
+
+# Nombre del equipo de ventas (crm.team) que delimita la línea de Transformación
+# Digital dentro del Odoo compartido con otras líneas de negocio de Firefly.
+NOMBRE_EQUIPO_TD = "TRANSFORMACION DIGITAL"
+
+
 # ─────────────────────────────────────────────
 # Carga de datos (cacheada 10 min)
 # ─────────────────────────────────────────────
@@ -138,6 +155,35 @@ LINEA_CATEGORIA = {
     "Soporte y Mantenimiento": "Soporte",
     "Licenciamiento": "Licenciamiento",
 }
+
+# Mapeo línea de negocio → nombre de cuenta analítica en Odoo, usado para traer los
+# costos del equipo (account.analytic.line no tiene equipo de ventas, así que la
+# cuenta analítica es lo único que permite ubicar el costo dentro de la línea). El
+# nombre de la cuenta no necesariamente coincide con el de la línea o la categoría
+# de producto (p. ej. "Implementación Odoo" factura en la categoría "Transformación
+# digital" pero sus costos están en la cuenta analítica "Implementación de software").
+LINEA_CUENTA_ANALITICA = {
+    "Implementación Odoo": "Implementación de software",
+    "Soporte y Mantenimiento": "Soporte y Mantenimiento",
+    "Licenciamiento": "Licenciamiento",
+}
+CUENTA_ANALITICA_LINEA = {v: k for k, v in LINEA_CUENTA_ANALITICA.items()}
+
+
+def clasificar_tags_lineas(tag_ids: list[int] | None, tag_names: pd.Series) -> tuple[list[str], bool]:
+    """A partir de los tag_ids (crm.tag) de una oportunidad, determina a qué
+    línea(s) de LINEA_CATEGORIA pertenece y si es cliente NUEVO. Además de las
+    etiquetas base ("Implementación Odoo", "Soporte y Mantenimiento"), en Odoo
+    existe una variación con "Nuevo" (p. ej. "Nuevo Implementación Odoo") para
+    marcar que la venta es de un cliente nuevo y no recurrente. Se compara por
+    substring (sin tildes/mayúsculas) para que esa variante siga clasificando en
+    su línea base en vez de caer en "Sin etiqueta"."""
+    nombres_norm = [_normalizar(tag_names.get(i, "")) for i in (tag_ids or [])]
+    nombres_norm = [n for n in nombres_norm if n]
+    es_nuevo = any("NUEVO" in n for n in nombres_norm)
+    lineas = [linea for linea in LINEA_CATEGORIA
+              if any(_normalizar(linea) in n for n in nombres_norm)]
+    return (lineas if lineas else ["Sin etiqueta"]), es_nuevo
 MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
@@ -294,7 +340,8 @@ def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
 def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     """Oportunidades GANADAS con fecha de cierre en el período, explotadas por etiqueta
     (línea de negocio). Si una oportunidad tiene varias etiquetas, su valor se cuenta
-    en cada una."""
+    en cada una. También expone si la etiqueta marca cliente nuevo (ver
+    clasificar_tags_lineas)."""
     domain = [
         ("type", "=", "opportunity"),
         ("probability", "=", 100),
@@ -303,7 +350,8 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
-    cols = ["name", "date_closed", "vendedor", "equipo", "expected_revenue", "mes", "linea"]
+    cols = ["name", "date_closed", "vendedor", "equipo", "expected_revenue", "mes",
+            "linea", "es_nuevo", "segmento"]
     df = search_read(
         "crm.lead", domain,
         ["name", "date_closed", "user_id", "team_id", "expected_revenue", "tag_ids"],
@@ -316,8 +364,10 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
-    df["linea"] = df["tag_ids"].apply(
-        lambda ids: [tag_names.get(i, "Sin etiqueta") for i in ids] if ids else ["Sin etiqueta"])
+    clasificacion = df["tag_ids"].apply(lambda ids: clasificar_tags_lineas(ids, tag_names))
+    df["linea"] = clasificacion.apply(lambda c: c[0])
+    df["es_nuevo"] = clasificacion.apply(lambda c: c[1])
+    df["segmento"] = df["es_nuevo"].map({True: "Nuevo", False: "Recurrente"})
     df = df.explode("linea")
     return df[cols]
 
@@ -550,13 +600,15 @@ def load_team_activities(team_ids: list[int]):
 
 @st.cache_data(ttl=600, show_spinner="Cargando costos analíticos por línea...")
 def load_analytic_costs_by_linea(date_from: str, date_to: str):
-    """Costos del equipo por línea de negocio, desde account.analytic.line:
-    una cuenta analítica por línea (mismo nombre que la línea en LINEA_CATEGORIA),
-    quedándonos solo con los movimientos de costo (importe negativo — convención
-    estándar de Odoo: ingresos positivos, egresos negativos)."""
+    """Costos del equipo por línea de negocio, desde account.analytic.line: una
+    cuenta analítica por línea, según LINEA_CUENTA_ANALITICA (el nombre de la
+    cuenta no siempre coincide con el nombre de la línea), quedándonos solo con
+    los movimientos de costo (importe negativo — convención estándar de Odoo:
+    ingresos positivos, egresos negativos)."""
     cols = ["date", "amount", "account_id"]
+    nombres_cuentas = list(LINEA_CUENTA_ANALITICA.values())
     domain = [
-        ("account_id.name", "in", list(LINEA_CATEGORIA.keys())),
+        ("account_id.name", "in", nombres_cuentas),
         ("date", ">=", date_from),
         ("date", "<=", date_to),
         ("amount", "<", 0),
@@ -566,13 +618,13 @@ def load_analytic_costs_by_linea(date_from: str, date_to: str):
     except Exception as e:
         return pd.DataFrame(columns=cols), (
             f"No se pudo consultar costos analíticos (account.analytic.line): {e}. "
-            f"Verifica que exista una cuenta analítica por línea, con el mismo nombre "
-            f"que la línea ({', '.join(LINEA_CATEGORIA.keys())})."
+            f"Verifica que existan las cuentas analíticas {', '.join(nombres_cuentas)} "
+            f"en Odoo."
         )
     if df.empty:
         return df, None
     df["date"] = pd.to_datetime(df["date"])
-    df["linea"] = m2o_name(df["account_id"])
+    df["linea"] = m2o_name(df["account_id"]).map(CUENTA_ANALITICA_LINEA)
     df["mes"] = df["date"].dt.to_period("M").astype(str)
     df["costo"] = -df["amount"]
     return df, None
@@ -632,13 +684,26 @@ else:
     st.stop()
 
 teams_df = load_teams()
+teams_td_df = teams_df[teams_df["name"].apply(lambda n: NOMBRE_EQUIPO_TD in _normalizar(n))]
+
+if teams_td_df.empty:
+    st.sidebar.error(
+        f"⚠️ No se encontró en Odoo (crm.team) ningún equipo de ventas llamado "
+        f"'{NOMBRE_EQUIPO_TD}'. El dashboard es exclusivo de esa línea de negocio, así "
+        "que no puede continuar sin ubicarlo — revisa el nombre exacto del equipo en Odoo."
+    )
+    st.stop()
+
 team_names = st.sidebar.multiselect(
-    "Equipos de venta",
-    options=teams_df["name"].tolist(),
+    "Equipos de venta (Transformación Digital)",
+    options=teams_td_df["name"].tolist(),
     default=[],
-    placeholder="Todos los equipos",
+    placeholder="Todos los equipos de Transformación Digital",
 )
-team_ids = teams_df.loc[teams_df["name"].isin(team_names), "id"].tolist()
+seleccionados = teams_td_df.loc[teams_td_df["name"].isin(team_names), "id"].tolist()
+# team_ids nunca queda vacío: sin selección, cae a TODOS los equipos de TD (nunca a
+# "todos los equipos de Odoo", que incluiría otras líneas de negocio de Firefly).
+team_ids = seleccionados if seleccionados else teams_td_df["id"].tolist()
 
 if st.sidebar.button("🔄 Refrescar datos"):
     st.cache_data.clear()
@@ -658,7 +723,8 @@ closed = load_pipeline_closed(d1, d2, team_ids)
 
 st.title("📊 Dashboard Transformación Digital")
 st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
-           + (f" · Equipos: {', '.join(team_names)}" if team_names else " · Todos los equipos"))
+           + (f" · Equipos: {', '.join(team_names)}" if team_names
+              else " · Todos los equipos de Transformación Digital"))
 
 (tab_td, tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes,
  tab_soporte, tab_rentabilidad, tab_equipo) = st.tabs(
@@ -1423,9 +1489,51 @@ with tab_lineas:
                          labels={"expected_revenue": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
+        st.markdown("#### 🆕 Ganado por línea: cliente Nuevo vs. Recurrente")
+        st.caption("Según la etiqueta de Odoo: la variación 'Nuevo' de la etiqueta de línea "
+                  "(p. ej. 'Nuevo Implementación Odoo') marca que la venta ganada es de un "
+                  "cliente nuevo; sin esa variación, se cuenta como recurrente.")
+        won_lineas_clasif = won_lineas[won_lineas["linea"] != "Sin etiqueta"]
+        sin_etiqueta_valor = won_lineas.loc[won_lineas["linea"] == "Sin etiqueta", "expected_revenue"].sum()
+        if sin_etiqueta_valor:
+            st.caption(f"⚠️ {fmt_money(sin_etiqueta_valor)} en oportunidades ganadas sin "
+                      "etiqueta de línea reconocida — no se incluyen en este desglose.")
+        if won_lineas_clasif.empty:
+            st.info("No hay oportunidades ganadas con etiqueta de línea en el período.")
+        else:
+            nuevo_vs_rec = (won_lineas_clasif.groupby(["linea", "segmento"], as_index=False)
+                            ["expected_revenue"].sum())
+            fig = px.bar(nuevo_vs_rec, x="linea", y="expected_revenue", color="segmento",
+                         barmode="stack", title="Ganado por línea: Nuevo vs. Recurrente",
+                         color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"},
+                         labels={"expected_revenue": "COP", "linea": "Línea", "segmento": "Segmento"})
+            st.plotly_chart(fig, use_container_width=True)
+
+            resumen_nuevo = (nuevo_vs_rec.pivot(index="linea", columns="segmento",
+                                                 values="expected_revenue").fillna(0))
+            for col in ("Nuevo", "Recurrente"):
+                if col not in resumen_nuevo.columns:
+                    resumen_nuevo[col] = 0.0
+            resumen_nuevo["Total"] = resumen_nuevo["Nuevo"] + resumen_nuevo["Recurrente"]
+            resumen_nuevo["% Nuevo"] = resumen_nuevo.apply(
+                lambda r: r["Nuevo"] / r["Total"] * 100 if r["Total"] else 0, axis=1)
+            resumen_nuevo = resumen_nuevo.reset_index()
+            st.dataframe(
+                resumen_nuevo, use_container_width=True, hide_index=True,
+                column_config={
+                    "linea": "Línea",
+                    "Nuevo": st.column_config.NumberColumn("Nuevo", format="$%,.0f"),
+                    "Recurrente": st.column_config.NumberColumn("Recurrente", format="$%,.0f"),
+                    "Total": st.column_config.NumberColumn("Total", format="$%,.0f"),
+                    "% Nuevo": st.column_config.ProgressColumn(
+                        "% Nuevo", format="%.1f%%", min_value=0, max_value=100),
+                },
+            )
+
         with st.expander("📋 Detalle de oportunidades ganadas por línea"):
             st.dataframe(
-                won_lineas[["name", "date_closed", "vendedor", "equipo", "linea", "expected_revenue"]],
+                won_lineas[["name", "date_closed", "vendedor", "equipo", "linea",
+                            "segmento", "expected_revenue"]],
                 use_container_width=True, hide_index=True,
             )
 
@@ -1674,9 +1782,9 @@ with tab_rentabilidad:
 
         if costos_rent.empty:
             st.info("No se encontraron movimientos de costo en las cuentas analíticas de las "
-                   "líneas para este año — revisa que las cuentas analíticas existan con el "
-                   f"nombre exacto de cada línea ({', '.join(LINEA_CATEGORIA.keys())}) y que "
-                   "tengan movimientos con importe negativo en el período.")
+                   "líneas para este año — revisa que existan las cuentas analíticas "
+                   f"({', '.join(LINEA_CUENTA_ANALITICA.values())}) y que tengan movimientos "
+                   "con importe negativo en el período.")
 
         total_fact = rent_tabla["facturado"].sum()
         total_costo = rent_tabla["costo"].sum()
