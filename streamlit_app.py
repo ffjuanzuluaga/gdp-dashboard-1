@@ -291,7 +291,7 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
         "crm.lead",
         domain,
         ["name", "create_date", "date_closed", "partner_id", "user_id", "team_id",
-         "stage_id", "expected_revenue", "probability", "active"],
+         "stage_id", "expected_revenue", "probability", "active", "won_status"],
         order="create_date",
     )
     if df.empty:
@@ -300,11 +300,7 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["equipo"] = m2o_name(df["team_id"])
     df["vendedor"] = m2o_name(df["user_id"])
     df["etapa"] = m2o_name(df["stage_id"])
-    df["estado"] = df.apply(
-        lambda r: "Ganada" if r["probability"] == 100
-        else ("Perdida" if not r["active"] else "Abierta"),
-        axis=1,
-    )
+    df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
     return df
 
 
@@ -341,10 +337,12 @@ def load_tags() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
 def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades GANADAS con fecha de cierre en el período (reporte de ganados)."""
+    """Oportunidades GANADAS con fecha de cierre en el período (reporte de ganados).
+    GANADA = won_status == 'won' (probability 100 Y stage_id.is_won — el campo real
+    de Odoo, más estricto que solo probability == 100)."""
     domain = [
         ("type", "=", "opportunity"),
-        ("probability", "=", 100),
+        ("won_status", "=", "won"),
         ("date_closed", ">=", date_from),
         ("date_closed", "<=", f"{date_to} 23:59:59"),
     ]
@@ -372,10 +370,10 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     """Oportunidades GANADAS con fecha de cierre en el período, explotadas por etiqueta
     (línea de negocio). Si una oportunidad tiene varias etiquetas, su valor se cuenta
     en cada una. También expone si la etiqueta marca cliente nuevo (ver
-    clasificar_tags_lineas)."""
+    clasificar_tags_lineas). GANADA = won_status == 'won' (ver load_won)."""
     domain = [
         ("type", "=", "opportunity"),
-        ("probability", "=", 100),
+        ("won_status", "=", "won"),
         ("date_closed", ">=", date_from),
         ("date_closed", "<=", f"{date_to} 23:59:59"),
     ]
@@ -515,7 +513,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df = search_read(
         "crm.lead", domain,
         ["name", "create_date", "user_id", "team_id", "medium_id",
-         "expected_revenue", "probability", "active", "type"],
+         "expected_revenue", "probability", "active", "type", "won_status"],
         order="create_date",
     )
     if df.empty:
@@ -525,21 +523,22 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
-    df["estado"] = df.apply(
-        lambda r: "Ganada" if r["probability"] == 100
-        else ("Perdida" if not r["active"] else "Abierta"),
-        axis=1,
-    )
+    df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
     return df
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cierres del período...")
 def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades GANADAS o PERDIDAS con fecha de cierre en el período,
-    sin importar cuándo se crearon (incluye leads heredados de períodos
-    anteriores que se cerraron ahora). Se usa para la tasa de conversión."""
+    """Oportunidades GANADAS o PERDIDAS (won_status en 'won'/'lost') con fecha de
+    cierre en el período, sin importar cuándo se crearon (incluye leads heredados
+    de períodos anteriores que se cerraron ahora). Se usa para la tasa de
+    conversión. date_closed puede quedar registrado también en casos que Odoo NO
+    considera won_status 'won' ni 'lost' (p. ej. archivado a media probabilidad),
+    así que se filtra explícitamente por won_status en vez de solo por que
+    date_closed exista."""
     domain = [
         ("type", "=", "opportunity"),
+        ("won_status", "in", ["won", "lost"]),
         ("date_closed", ">=", date_from),
         ("date_closed", "<=", f"{date_to} 23:59:59"),
         "|", ("active", "=", True), ("active", "=", False),
@@ -549,7 +548,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     df = search_read(
         "crm.lead", domain,
         ["name", "date_closed", "user_id", "team_id", "medium_id",
-         "expected_revenue", "probability", "active"],
+         "expected_revenue", "probability", "active", "won_status"],
         order="date_closed",
     )
     if df.empty:
@@ -559,7 +558,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
-    df["estado"] = df.apply(lambda r: "Ganada" if r["probability"] == 100 else "Perdida", axis=1)
+    df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida"})
     return df
 
 
@@ -629,33 +628,45 @@ def load_sold_hours_lines(date_from: str, date_to: str, team_ids: list[int]):
     return df, None
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando actividades del equipo...")
-def load_team_activities(team_ids: list[int]):
-    """Actividades PENDIENTES (mail.activity) de crm.lead, por tipo y vendedor.
-    OJO: Odoo elimina las actividades de mail.activity al marcarlas 'hecho' (se
-    convierten en un mensaje en el chatter), así que esto es una FOTO del
-    backlog actual — no un histórico mensual de actividades completadas. No
-    incluye horas: mail.activity no trae duración en Odoo estándar."""
-    cols = ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"]
+@st.cache_data(ttl=600, show_spinner="Cargando reporte de actividades CRM...")
+def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
+    """Actividades del equipo desde crm.activity.report — el reporte estándar de
+    Odoo detrás de 'CRM > Informes > Actividades'. Es una vista SQL sobre
+    mail.message (no sobre mail.activity), por eso SÍ conserva el histórico
+    completo de actividades ya completadas y permite una tendencia mensual real.
+    'date' = fecha en que se completó la actividad; 'user_id' = vendedor dueño de
+    la oportunidad (l.user_id), no necesariamente quien registró la actividad;
+    'tag_ids' es un related a lead_id.tag_ids (confirmado en
+    odoo/addons/crm/report/crm_activity_report.py). Se clasifica por línea con las
+    mismas etiquetas de crm.lead (ver clasificar_tags_lineas) y solo se dejan
+    Implementación Odoo y Soporte y Mantenimiento — Licenciamiento no tiene este
+    seguimiento de actividad comercial."""
+    cols = ["date", "mail_activity_type_id", "user_id", "team_id", "tag_ids"]
+    domain = [
+        ("date", ">=", date_from),
+        ("date", "<=", f"{date_to} 23:59:59"),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
     try:
-        df = search_read(
-            "mail.activity",
-            [("res_model", "=", "crm.lead")],
-            cols,
-        )
+        df = search_read("crm.activity.report", domain, cols, order="date")
     except Exception as e:
-        return pd.DataFrame(columns=cols), f"No se pudo consultar actividades (mail.activity): {e}"
+        return pd.DataFrame(columns=cols), (
+            f"No se pudo consultar crm.activity.report: {e}. Se intentó con los campos "
+            f"`date`, `mail_activity_type_id`, `user_id`, `team_id`, `tag_ids`."
+        )
     if df.empty:
         return df, None
-    df["tipo"] = m2o_name(df["activity_type_id"])
+    tag_names = load_tags().set_index("id")["name"]
+    df["date"] = pd.to_datetime(df["date"])
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["tipo"] = m2o_name(df["mail_activity_type_id"])
     df["vendedor"] = m2o_name(df["user_id"])
-    df["date_deadline"] = pd.to_datetime(df["date_deadline"])
-    df["mes_vencimiento"] = df["date_deadline"].dt.to_period("M").astype(str)
-    if team_ids:
-        leads_ids = set(
-            search_read("crm.lead", [("team_id", "in", team_ids)], ["id"])["id"].tolist()
-        )
-        df = df[df["res_id"].isin(leads_ids)]
+    df["equipo"] = m2o_name(df["team_id"])
+    clasificacion = df["tag_ids"].apply(lambda ids: clasificar_tags_lineas(ids, tag_names))
+    df["linea"] = clasificacion.apply(lambda c: c[0])
+    df = df.explode("linea")
+    df = df[df["linea"].isin(["Implementación Odoo", "Soporte y Mantenimiento"])]
     return df, None
 
 
@@ -2110,49 +2121,48 @@ with tab_equipo:
             )
 
     st.divider()
-    st.markdown("#### 👥 Actividades del equipo (backlog actual)")
-    st.caption("⚠️ Odoo elimina las actividades (`mail.activity`) al marcarlas como hechas — "
-               "se convierten en un mensaje en el historial del registro, no en un log "
-               "consultable por mes. Por eso esto es una **foto del backlog pendiente hoy** "
-               "por tipo y vendedor (agrupado por mes de vencimiento), no un histórico de "
-               "actividades ya completadas. Tampoco incluye horas: `mail.activity` no trae "
-               "duración en Odoo estándar. Si necesitan el histórico completo (presentación "
-               "de negocio, propuesta, socialización de propuesta, seguimiento) con horas, "
-               "hay que definir un registro dedicado — avísenme y lo armamos.")
+    st.markdown("#### 👥 Actividades del equipo por línea y mes (últimos 12 meses)")
+    st.caption("Fuente: `crm.activity.report` (el reporte estándar de Odoo detrás de "
+              "'CRM > Informes > Actividades'), que sí conserva el histórico completo — a "
+              "diferencia de `mail.activity`, que se borra al marcar la actividad como hecha. "
+              "Solo Implementación Odoo y Soporte y Mantenimiento (Licenciamiento no tiene "
+              "este seguimiento de actividad comercial).")
 
-    actividades, err_act = load_team_activities(team_ids)
-    if err_act:
-        st.warning(err_act)
-    elif actividades.empty:
-        st.info("No hay actividades pendientes sobre oportunidades (crm.lead) en este momento.")
+    actividades_crm, err_act_crm = load_crm_activity_report(
+        desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
+    if err_act_crm:
+        st.warning(err_act_crm)
+    elif actividades_crm.empty:
+        st.info("No hay actividades de Implementación Odoo o Soporte y Mantenimiento en "
+                "crm.activity.report para los últimos 12 meses.")
     else:
         c1, c2 = st.columns(2)
-        c1.metric("Actividades pendientes", len(actividades))
-        c2.metric("Tipos distintos", actividades["tipo"].nunique())
+        c1.metric("Actividades registradas", len(actividades_crm))
+        c2.metric("Tipos distintos", actividades_crm["tipo"].nunique())
 
         col_a1, col_a2 = st.columns(2)
         with col_a1:
-            por_tipo_vend = (actividades.groupby(["tipo", "vendedor"], as_index=False)
-                             .agg(cantidad=("res_id", "count")))
-            fig = px.bar(por_tipo_vend, x="tipo", y="cantidad", color="vendedor",
-                         barmode="group", title="Actividades pendientes por tipo y vendedor",
-                         labels={"cantidad": "Actividades", "tipo": "Tipo"})
+            cantidad_linea_mes = (actividades_crm.groupby(["mes", "linea"], as_index=False)
+                                  .agg(cantidad=("tipo", "count")))
+            fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
+                         title="Actividades por línea y mes",
+                         labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
             st.plotly_chart(fig, use_container_width=True)
         with col_a2:
-            por_mes_tipo = (actividades.groupby(["mes_vencimiento", "tipo"], as_index=False)
-                            .agg(cantidad=("res_id", "count")))
-            fig = px.bar(por_mes_tipo, x="mes_vencimiento", y="cantidad", color="tipo",
-                         barmode="group", title="Actividades pendientes por mes de vencimiento",
-                         labels={"cantidad": "Actividades", "mes_vencimiento": "Mes"})
+            por_tipo_vend = (actividades_crm.groupby(["tipo", "vendedor"], as_index=False)
+                             .agg(cantidad=("mes", "count")))
+            fig = px.bar(por_tipo_vend, x="tipo", y="cantidad", color="vendedor",
+                         barmode="group", title="Actividades por tipo y vendedor",
+                         labels={"cantidad": "Actividades", "tipo": "Tipo"})
             st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("📋 Detalle de actividades pendientes"):
+        with st.expander("📋 Detalle de actividades"):
             st.dataframe(
-                actividades[["tipo", "vendedor", "date_deadline", "create_date"]]
-                    .sort_values("date_deadline"),
+                actividades_crm[["date", "linea", "tipo", "vendedor", "equipo"]]
+                    .sort_values("date", ascending=False),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "tipo": "Tipo", "vendedor": "Vendedor",
-                    "date_deadline": "Vence", "create_date": "Creada",
+                    "date": "Fecha", "linea": "Línea", "tipo": "Tipo",
+                    "vendedor": "Vendedor", "equipo": "Equipo",
                 },
             )
