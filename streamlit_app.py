@@ -503,7 +503,8 @@ def construir_pivote_cumplimiento(datos: pd.DataFrame, value_col: str, year: int
 
 @st.cache_data(ttl=600, show_spinner="Cargando leads y pipeline completo...")
 def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Todo el pipeline (leads + oportunidades) con origen, para el reporte de conversión."""
+    """Todo el pipeline (leads + oportunidades) con medio (utm.medium), para el
+    reporte de conversión."""
     domain = [
         ("create_date", ">=", date_from),
         ("create_date", "<=", f"{date_to} 23:59:59"),
@@ -513,7 +514,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
         domain.append(("team_id", "in", team_ids))
     df = search_read(
         "crm.lead", domain,
-        ["name", "create_date", "user_id", "team_id", "source_id",
+        ["name", "create_date", "user_id", "team_id", "medium_id",
          "expected_revenue", "probability", "active", "type"],
         order="create_date",
     )
@@ -523,7 +524,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["mes"] = df["create_date"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
-    df["origen"] = m2o_name(df["source_id"])
+    df["medio"] = m2o_name(df["medium_id"])
     df["estado"] = df.apply(
         lambda r: "Ganada" if r["probability"] == 100
         else ("Perdida" if not r["active"] else "Abierta"),
@@ -547,7 +548,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
         domain.append(("team_id", "in", team_ids))
     df = search_read(
         "crm.lead", domain,
-        ["name", "date_closed", "user_id", "team_id", "source_id",
+        ["name", "date_closed", "user_id", "team_id", "medium_id",
          "expected_revenue", "probability", "active"],
         order="date_closed",
     )
@@ -557,7 +558,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
-    df["origen"] = m2o_name(df["source_id"])
+    df["medio"] = m2o_name(df["medium_id"])
     df["estado"] = df.apply(lambda r: "Ganada" if r["probability"] == 100 else "Perdida", axis=1)
     return df
 
@@ -1348,22 +1349,22 @@ with tab_leads:
                          labels={"leads": "Leads", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
-            mensual_origen = (leads_full.groupby(["mes", "origen"], as_index=False)
-                              .agg(leads=("name", "count")))
-            fig = px.bar(mensual_origen, x="mes", y="leads", color="origen",
-                         barmode="group", title="Leads creados por origen y mes",
+            mensual_medio = (leads_full.groupby(["mes", "medio"], as_index=False)
+                             .agg(leads=("name", "count")))
+            fig = px.bar(mensual_medio, x="mes", y="leads", color="medio",
+                         barmode="group", title="Leads creados por medio y mes",
                          labels={"leads": "Leads", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
         col_a, col_b = st.columns(2)
         with col_a:
             if not leads_full.empty:
-                por_origen = (leads_full.groupby("origen", as_index=False)
-                              .agg(leads=("name", "count"))
-                              .sort_values("leads", ascending=True).tail(10))
-                fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
-                             title="Leads creados por origen", text_auto=True,
-                             labels={"leads": "Leads", "origen": ""})
+                por_medio = (leads_full.groupby("medio", as_index=False)
+                             .agg(leads=("name", "count"))
+                             .sort_values("leads", ascending=True).tail(10))
+                fig = px.bar(por_medio, x="leads", y="medio", orientation="h",
+                             title="Leads creados por medio", text_auto=True,
+                             labels={"leads": "Leads", "medio": ""})
                 st.plotly_chart(fig, use_container_width=True)
         with col_b:
             if not leads_full.empty:
@@ -1386,18 +1387,18 @@ with tab_leads:
                 st.plotly_chart(fig, use_container_width=True)
 
         if not closed.empty:
-            conv_origen = closed.groupby("origen", as_index=False).agg(
+            conv_medio = closed.groupby("medio", as_index=False).agg(
                 ganadas=("estado", lambda s: (s == "Ganada").sum()),
                 cerradas=("estado", "count"),
             )
-            conv_origen["tasa_conversion"] = conv_origen.apply(
+            conv_medio["tasa_conversion"] = conv_medio.apply(
                 lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
-            st.markdown("#### Conversión por origen (por fecha de cierre)")
+            st.markdown("#### Conversión por medio (por fecha de cierre)")
             st.dataframe(
-                conv_origen.sort_values("cerradas", ascending=False),
+                conv_medio.sort_values("cerradas", ascending=False),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "origen": "Origen",
+                    "medio": "Medio",
                     "ganadas": "Ganadas",
                     "cerradas": "Cerradas",
                     "tasa_conversion": st.column_config.ProgressColumn(
@@ -1408,14 +1409,14 @@ with tab_leads:
         if not leads_full.empty:
             with st.expander("📋 Detalle de leads creados en el período"):
                 st.dataframe(
-                    leads_full[["name", "create_date", "vendedor", "equipo", "origen",
+                    leads_full[["name", "create_date", "vendedor", "equipo", "medio",
                                 "estado", "expected_revenue"]],
                     use_container_width=True, hide_index=True,
                 )
         if not closed.empty:
             with st.expander("📋 Detalle de cierres (ganados/perdidos) en el período"):
                 st.dataframe(
-                    closed[["name", "date_closed", "vendedor", "equipo", "origen",
+                    closed[["name", "date_closed", "vendedor", "equipo", "medio",
                             "estado", "expected_revenue"]],
                     use_container_width=True, hide_index=True,
                 )
