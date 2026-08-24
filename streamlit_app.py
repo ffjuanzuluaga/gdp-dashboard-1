@@ -190,8 +190,33 @@ def clasificar_tags_lineas(tag_ids: list[int] | None, tag_names: pd.Series) -> t
     lineas = [linea for linea in LINEA_CATEGORIA
               if any(_normalizar(linea) in n for n in nombres_norm)]
     return (lineas if lineas else ["Sin etiqueta"]), es_nuevo
+
+
 MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+# Códigos de "partes de horas" (hojas de horas estándar de Odoo, account.analytic.line)
+# que el equipo comercial usa para registrar actividad comercial no facturable:
+# presentación de negocio, cotización/propuesta, sustentación de propuesta y
+# seguimiento a cliente. Solo aplican a Implementación Odoo y Soporte y
+# Mantenimiento (Licenciamiento no tiene este seguimiento).
+GC_ACTIVIDAD = {
+    "GC3": "Reunión de presentación de negocio",
+    "GC5": "Cotización / Propuesta",
+    "GC6": "Sustentación de propuesta",
+    "GC8": "Seguimiento Cliente",
+}
+
+
+def _clasificar_gc(*textos: str) -> str | None:
+    """Busca un código GC3/GC5/GC6/GC8 en cualquiera de los textos dados (p. ej. la
+    descripción de la línea de horas y el nombre de la tarea asociada — no sabemos
+    en cuál de los dos vive el código en este Odoo, así que se revisan ambos)."""
+    combinado = _normalizar(" ".join(t for t in textos if t))
+    for codigo in GC_ACTIVIDAD:
+        if codigo in combinado:
+            return codigo
+    return None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
@@ -415,10 +440,30 @@ def load_cumplimiento_mensual(year: int, team_ids: list[int]) -> pd.DataFrame:
     return tabla
 
 
+def meta_prorateada_a_hoy(meta_anual: float, year: int, hoy: date) -> float:
+    """Meta prorateada según el avance del año, para poder comparar 'vamos en línea
+    con la meta' además del cumplimiento sobre la meta anual completa. Ejemplo: meta
+    anual 12M, hoy es 30 de junio (mitad del año) → meta prorateada 6M; si llevo
+    vendidos 6M, el cumplimiento A LA FECHA es 100% (voy como se esperaba a estas
+    alturas del año), aunque el cumplimiento ANUAL sea apenas 50%. Para años ya
+    cerrados devuelve la meta completa (el año entero ya transcurrió); para años
+    futuros devuelve 0."""
+    if year < hoy.year:
+        return meta_anual
+    if year > hoy.year:
+        return 0.0
+    dias_transcurridos = (hoy - date(year, 1, 1)).days + 1
+    dias_anio = 366 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 365
+    return meta_anual * dias_transcurridos / dias_anio
+
+
 def construir_pivote_cumplimiento(datos: pd.DataFrame, value_col: str, year: int,
-                                   metas_lineas: pd.DataFrame) -> pd.DataFrame:
+                                   metas_lineas: pd.DataFrame, hoy: date) -> pd.DataFrame:
     """Matriz línea (filas, + TOTAL) x mes (columnas, + Acumulado + % Cumpl.
-    Anual), al estilo del reporte de referencia en Excel/Sheets."""
+    Anual + % Cumpl. a la Fecha), al estilo del reporte de referencia en
+    Excel/Sheets. % Cumpl. a la Fecha solo se calcula para columnas de valor
+    acumulable (vendido/facturado) — no aplica para "diferencia"."""
+    incluir_a_la_fecha = value_col != "diferencia"
     filas = []
     for linea in LINEA_CATEGORIA:
         meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
@@ -433,6 +478,10 @@ def construir_pivote_cumplimiento(datos: pd.DataFrame, value_col: str, year: int
             acumulado += valor
         fila["Acumulado"] = acumulado
         fila["% Cumpl. Anual"] = (acumulado / meta_anual * 100) if meta_anual else 0.0
+        if incluir_a_la_fecha:
+            meta_a_la_fecha = meta_prorateada_a_hoy(meta_anual, year, hoy)
+            fila["% Cumpl. a la Fecha"] = (acumulado / meta_a_la_fecha * 100) if meta_a_la_fecha else 0.0
+            fila["_meta_a_la_fecha"] = meta_a_la_fecha
         fila["_meta_anual"] = meta_anual
         filas.append(fila)
 
@@ -443,6 +492,11 @@ def construir_pivote_cumplimiento(datos: pd.DataFrame, value_col: str, year: int
     total["Acumulado"] = tabla["Acumulado"].sum()
     meta_total = tabla["_meta_anual"].sum()
     total["% Cumpl. Anual"] = (total["Acumulado"] / meta_total * 100) if meta_total else 0.0
+    if incluir_a_la_fecha:
+        meta_a_la_fecha_total = tabla["_meta_a_la_fecha"].sum()
+        total["% Cumpl. a la Fecha"] = (
+            total["Acumulado"] / meta_a_la_fecha_total * 100) if meta_a_la_fecha_total else 0.0
+        tabla = tabla.drop(columns="_meta_a_la_fecha")
     tabla = tabla.drop(columns="_meta_anual")
     return pd.concat([tabla, pd.DataFrame([total])], ignore_index=True)
 
@@ -601,6 +655,43 @@ def load_team_activities(team_ids: list[int]):
             search_read("crm.lead", [("team_id", "in", team_ids)], ["id"])["id"].tolist()
         )
         df = df[df["res_id"].isin(leads_ids)]
+    return df, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando partes de horas del equipo...")
+def load_partes_horas(date_from: str, date_to: str):
+    """Partes de horas del equipo comercial (account.analytic.line, hojas de horas
+    estándar de Odoo), clasificadas por línea de negocio (misma cuenta analítica
+    que los costos, ver LINEA_CUENTA_ANALITICA — por eso solo trae Implementación
+    Odoo y Soporte y Mantenimiento, Licenciamiento no tiene este seguimiento) y por
+    tipo de actividad comercial según el código GC3/GC5/GC6/GC8 (ver GC_ACTIVIDAD),
+    que puede estar en la descripción de la línea o en el nombre de la tarea — se
+    buscan ambos. A diferencia de mail.activity, estos registros SÍ persisten en el
+    tiempo, así que permiten un histórico mensual real (no solo una foto de hoy)."""
+    cols = ["date", "name", "unit_amount", "employee_id", "account_id", "task_id"]
+    cuentas_relevantes = [LINEA_CUENTA_ANALITICA["Implementación Odoo"],
+                          LINEA_CUENTA_ANALITICA["Soporte y Mantenimiento"]]
+    domain = [
+        ("account_id.name", "in", cuentas_relevantes),
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+    ]
+    try:
+        df = search_read("account.analytic.line", domain, cols)
+    except Exception as e:
+        return pd.DataFrame(columns=cols), (
+            f"No se pudo consultar partes de horas (account.analytic.line): {e}."
+        )
+    if df.empty:
+        return df, None
+    df["date"] = pd.to_datetime(df["date"])
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["linea"] = m2o_name(df["account_id"]).map(CUENTA_ANALITICA_LINEA)
+    df["vendedor"] = m2o_name(df["employee_id"])
+    df["tarea"] = df["task_id"].apply(lambda v: v[1] if isinstance(v, (list, tuple)) else "")
+    df["gc"] = df.apply(lambda r: _clasificar_gc(r["name"], r["tarea"]), axis=1)
+    df["actividad"] = df["gc"].map(GC_ACTIVIDAD)
+    df = df[df["gc"].notna()].copy()
     return df, None
 
 
@@ -767,13 +858,19 @@ with tab_td:
         vendido_anual_td = datos_td["vendido"].sum()
         facturado_anual_td = datos_td["facturado"].sum()
         pct_anual_td = (facturado_anual_td / meta_anual_td * 100) if meta_anual_td else 0
+        meta_a_la_fecha_td = meta_prorateada_a_hoy(meta_anual_td, anio_td, hoy)
+        pct_a_la_fecha_td = (facturado_anual_td / meta_a_la_fecha_td * 100) if meta_a_la_fecha_td else 0
 
         st.markdown("#### 🎯 Resumen del año")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Meta de ventas año", fmt_money(meta_anual_td))
         c2.metric("Ventas acumuladas del año", fmt_money(vendido_anual_td))
         c3.metric("Facturación acumulada del año", fmt_money(facturado_anual_td))
         c4.metric("% cumplimiento anual", f"{pct_anual_td:.1f}%")
+        c5.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_td:.1f}%",
+                  help="Contra la meta prorateada según los días transcurridos del año "
+                       "(no la meta anual completa): 100% = vamos exactamente como se "
+                       "esperaba a estas alturas del año.")
 
         if anio_td == hoy.year:
             st.markdown("#### 📅 Mes actual")
@@ -884,14 +981,21 @@ with tab_td:
         resumen_tipo["facturado"] = resumen_tipo["facturado"].fillna(0)
         resumen_tipo["pct"] = resumen_tipo.apply(
             lambda r: r["facturado"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
+        resumen_tipo["meta_a_la_fecha"] = resumen_tipo["meta_anual"].apply(
+            lambda m: meta_prorateada_a_hoy(m, anio_td, hoy))
+        resumen_tipo["pct_a_la_fecha"] = resumen_tipo.apply(
+            lambda r: r["facturado"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
         st.dataframe(
-            resumen_tipo, use_container_width=True, hide_index=True,
+            resumen_tipo[["linea", "meta_anual", "facturado", "pct", "pct_a_la_fecha"]],
+            use_container_width=True, hide_index=True,
             column_config={
                 "linea": "Línea",
                 "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
                 "facturado": st.column_config.NumberColumn("Total facturado", format="$%,.0f"),
-                "pct": st.column_config.ProgressColumn("% cumplimiento", format="%.1f%%",
+                "pct": st.column_config.ProgressColumn("% cumplimiento anual", format="%.1f%%",
                                                         min_value=0, max_value=150),
+                "pct_a_la_fecha": st.column_config.ProgressColumn(
+                    "% cumplimiento a la fecha", format="%.1f%%", min_value=0, max_value=150),
             },
         )
 
@@ -1058,14 +1162,21 @@ with tab_fact:
         vendido_total = datos_cumpl["vendido"].sum()
         facturado_total = datos_cumpl["facturado"].sum()
         pct_anual_total = (facturado_total / meta_anual_total * 100) if meta_anual_total else 0
+        meta_a_la_fecha_total = meta_prorateada_a_hoy(meta_anual_total, anio_cumpl, hoy)
+        pct_a_la_fecha_total = (facturado_total / meta_a_la_fecha_total * 100) if meta_a_la_fecha_total else 0
         diferencia_total = facturado_total - meta_anual_total
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Meta anual (3 líneas)", fmt_money(meta_anual_total))
         c2.metric("Vendido acumulado", fmt_money(vendido_total))
         c3.metric("Facturado acumulado", fmt_money(facturado_total))
         c4.metric("% cumplimiento anual", f"{pct_anual_total:.1f}%")
-        c5.metric("Diferencia vs. meta anual", fmt_money(diferencia_total))
+        c5.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_total:.1f}%",
+                  help="Compara lo facturado contra la meta prorateada según los días "
+                       "transcurridos del año (no contra la meta anual completa): 100% "
+                       "significa que vamos exactamente como se esperaba a estas alturas "
+                       "del año.")
+        c6.metric("Diferencia vs. meta anual", fmt_money(diferencia_total))
 
         with st.expander("📌 Metas anuales y mensuales por línea"):
             ref = metas_lineas_cumpl[metas_lineas_cumpl["linea"].isin(LINEA_CATEGORIA)].copy()
@@ -1105,14 +1216,16 @@ with tab_fact:
         col_config_pivote["Acumulado"] = st.column_config.NumberColumn("Acumulado", format="$%,.0f")
         col_config_pivote["% Cumpl. Anual"] = st.column_config.ProgressColumn(
             "% Cumpl. Anual", format="%.1f%%", min_value=0, max_value=150)
+        col_config_pivote["% Cumpl. a la Fecha"] = st.column_config.ProgressColumn(
+            "% Cumpl. a la Fecha", format="%.1f%%", min_value=0, max_value=150)
 
         st.markdown("#### 📈 Ventas (CRM ganado) por línea y mes")
-        pivote_ventas = construir_pivote_cumplimiento(datos_cumpl, "vendido", anio_cumpl, metas_lineas_cumpl)
+        pivote_ventas = construir_pivote_cumplimiento(datos_cumpl, "vendido", anio_cumpl, metas_lineas_cumpl, hoy)
         st.dataframe(pivote_ventas, use_container_width=True, hide_index=True,
                      column_config=col_config_pivote)
 
         st.markdown("#### 🧾 Facturado por línea y mes")
-        pivote_facturado = construir_pivote_cumplimiento(datos_cumpl, "facturado", anio_cumpl, metas_lineas_cumpl)
+        pivote_facturado = construir_pivote_cumplimiento(datos_cumpl, "facturado", anio_cumpl, metas_lineas_cumpl, hoy)
         st.dataframe(pivote_facturado, use_container_width=True, hide_index=True,
                      column_config=col_config_pivote)
 
@@ -1123,7 +1236,7 @@ with tab_fact:
         col_config_dif["Acumulado"] = st.column_config.NumberColumn("Acumulado", format="$%,.0f")
         col_config_dif["% Cumpl. Anual"] = st.column_config.NumberColumn(
             "% variación vs. meta anual", format="%.1f%%")
-        pivote_dif = construir_pivote_cumplimiento(datos_cumpl, "diferencia", anio_cumpl, metas_lineas_cumpl)
+        pivote_dif = construir_pivote_cumplimiento(datos_cumpl, "diferencia", anio_cumpl, metas_lineas_cumpl, hoy)
         st.dataframe(pivote_dif, use_container_width=True, hide_index=True,
                      column_config=col_config_dif)
 
@@ -1253,16 +1366,22 @@ with tab_leads:
                              labels={"leads": "Leads", "origen": ""})
                 st.plotly_chart(fig, use_container_width=True)
         with col_b:
-            if not closed.empty:
-                conv_vendedor = closed.groupby("vendedor", as_index=False).agg(
-                    ganadas=("estado", lambda s: (s == "Ganada").sum()),
-                    cerradas=("estado", "count"),
-                )
+            if not leads_full.empty:
+                # Regla de la dueña del proceso: tasa de conversión = ganadas (cerradas
+                # GANADAS en el período, por fecha de cierre) / leads creados en el
+                # período (por fecha de creación) — no ganadas/cerradas.
+                leads_x_vend = leads_full.groupby("vendedor", as_index=False).agg(leads=("name", "count"))
+                ganadas_x_vend = (closed[closed["estado"] == "Ganada"]
+                                   .groupby("vendedor", as_index=False).agg(ganadas=("name", "count"))
+                                   if not closed.empty else pd.DataFrame(columns=["vendedor", "ganadas"]))
+                conv_vendedor = leads_x_vend.merge(ganadas_x_vend, on="vendedor", how="left")
+                conv_vendedor["ganadas"] = conv_vendedor["ganadas"].fillna(0)
                 conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
-                    lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
+                    lambda r: r["ganadas"] / r["leads"] * 100 if r["leads"] else 0, axis=1)
                 fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
                              x="tasa_conversion", y="vendedor", orientation="h",
-                             title="Tasa de conversión por vendedor (por cierre)", text_auto=".1f",
+                             title="Tasa de conversión por vendedor (ganadas / leads creados)",
+                             text_auto=".1f",
                              labels={"tasa_conversion": "% conversión", "vendedor": ""})
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1413,6 +1532,34 @@ with tab_metas:
                                                      anio_metas_vend, metas)
             st.dataframe(pivote_vend, use_container_width=True, hide_index=True,
                          column_config=col_config_pivote_v)
+
+            with st.expander("📋 Detalle: cumplimiento MENSUAL por vendedor (no anual)"):
+                st.caption("A diferencia de la tabla de arriba (que acumula todo el año contra "
+                          "la meta anual completa), aquí cada mes se compara contra su propia "
+                          "cuota mensual (meta anual / 12) — así se ve si un vendedor cumplió "
+                          "SU mes, no solo si va bien en el acumulado del año.")
+                meses_anio_vend = [f"{anio_metas_vend}-{m:02d}" for m in range(1, 13)]
+                base_vend = pd.MultiIndex.from_product(
+                    [metas["vendedor"], meses_anio_vend], names=["vendedor", "mes"]).to_frame(index=False)
+                vendido_mensual_vend = (won_anio_vend.groupby(["vendedor", "mes"], as_index=False)
+                                        ["expected_revenue"].sum().rename(columns={"expected_revenue": "vendido"}))
+                detalle_vend = base_vend.merge(vendido_mensual_vend, on=["vendedor", "mes"], how="left")
+                detalle_vend["vendido"] = detalle_vend["vendido"].fillna(0)
+                meta_mensual_vend = metas.set_index("vendedor")["meta_anual"] / 12
+                detalle_vend["meta_mensual"] = detalle_vend["vendedor"].map(meta_mensual_vend).fillna(0)
+                detalle_vend["pct_cumpl_mensual"] = detalle_vend.apply(
+                    lambda r: r["vendido"] / r["meta_mensual"] * 100 if r["meta_mensual"] else 0, axis=1)
+                st.dataframe(
+                    detalle_vend.sort_values(["vendedor", "mes"]),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "vendedor": "Vendedor", "mes": "Mes",
+                        "meta_mensual": st.column_config.NumberColumn("Meta mensual", format="$%,.0f"),
+                        "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                        "pct_cumpl_mensual": st.column_config.ProgressColumn(
+                            "% Cumpl. mensual", format="%.1f%%", min_value=0, max_value=150),
+                    },
+                )
 
 # ─────────────────────────────────────────────
 # TAB: Metas por línea (ganados CRM clasificados por etiqueta vs metas_lineas.csv)
@@ -1893,6 +2040,73 @@ with tab_equipo:
                          barmode="group", title="Horas vendidas por vendedor y mes",
                          labels={"product_uom_qty": "Horas", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### 📞 Actividades comerciales del equipo por línea y mes (últimos 12 meses)")
+    st.caption("Partes de horas (hojas de horas de Odoo) de actividad comercial no facturable: "
+               "presentación de negocio, cotización/propuesta, sustentación de propuesta y "
+               "seguimiento a cliente. Solo Implementación Odoo y Soporte y Mantenimiento tienen "
+               "este seguimiento (Licenciamiento no). A diferencia del backlog de abajo, esto sí "
+               "es un histórico real mes a mes, porque las horas quedan registradas y no se "
+               "borran como las actividades de mail.activity.")
+
+    desde_12m_gc = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
+    partes_horas, err_gc = load_partes_horas(desde_12m_gc.isoformat(), hoy.isoformat())
+    if err_gc:
+        st.warning(err_gc)
+    elif partes_horas.empty:
+        st.info("No hay partes de horas con código GC3/GC5/GC6/GC8 en los últimos 12 meses. "
+                "Si el código está en un campo distinto al esperado (descripción de la línea o "
+                "nombre de la tarea), avísame para ajustar la búsqueda.")
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("Partes de horas registrados", len(partes_horas))
+        c2.metric("Horas totales", f"{partes_horas['unit_amount'].sum():,.1f} h")
+
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            cantidad_linea_mes = (partes_horas.groupby(["mes", "linea"], as_index=False)
+                                  .agg(cantidad=("unit_amount", "count")))
+            fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
+                         title="Cantidad de actividades por línea y mes",
+                         labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_g2:
+            horas_linea_mes = (partes_horas.groupby(["mes", "linea"], as_index=False)
+                               ["unit_amount"].sum())
+            fig = px.bar(horas_linea_mes, x="mes", y="unit_amount", color="linea", barmode="group",
+                         title="Horas invertidas por línea y mes",
+                         labels={"unit_amount": "Horas", "mes": "Mes", "linea": "Línea"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        col_g3, col_g4 = st.columns(2)
+        with col_g3:
+            cantidad_tipo_vend = (partes_horas.groupby(["actividad", "vendedor"], as_index=False)
+                                  .agg(cantidad=("unit_amount", "count")))
+            fig = px.bar(cantidad_tipo_vend, x="actividad", y="cantidad", color="vendedor",
+                         barmode="group", title="Cantidad de actividades por tipo y vendedor",
+                         labels={"cantidad": "Actividades", "actividad": "Tipo de actividad"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_g4:
+            horas_tipo_vend = (partes_horas.groupby(["actividad", "vendedor"], as_index=False)
+                               ["unit_amount"].sum())
+            fig = px.bar(horas_tipo_vend, x="actividad", y="unit_amount", color="vendedor",
+                         barmode="group", title="Horas por tipo y vendedor",
+                         labels={"unit_amount": "Horas", "actividad": "Tipo de actividad"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de partes de horas"):
+            st.dataframe(
+                partes_horas[["date", "linea", "actividad", "vendedor", "unit_amount", "name"]]
+                    .sort_values("date", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "date": "Fecha", "linea": "Línea", "actividad": "Tipo de actividad",
+                    "vendedor": "Vendedor",
+                    "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
+                    "name": "Descripción",
+                },
+            )
 
     st.divider()
     st.markdown("#### 👥 Actividades del equipo (backlog actual)")
