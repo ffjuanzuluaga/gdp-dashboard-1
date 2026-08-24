@@ -638,6 +638,48 @@ def load_sold_hours_lines(date_from: str, date_to: str, team_ids: list[int]):
     return df, None
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando reporte de actividades CRM...")
+def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
+    """Actividades del equipo desde crm.activity.report — el reporte estándar de
+    Odoo detrás de 'CRM > Informes > Actividades'. Es una vista SQL sobre
+    mail.message (no sobre mail.activity), por eso SÍ conserva el histórico
+    completo de actividades ya completadas y permite una tendencia mensual real.
+    'date' = fecha en que se completó la actividad; 'user_id' = vendedor dueño de
+    la oportunidad (l.user_id), no necesariamente quien registró la actividad;
+    'tag_ids' es un related a lead_id.tag_ids (confirmado en
+    odoo/addons/crm/report/crm_activity_report.py). Se clasifica por línea con las
+    mismas etiquetas de crm.lead (ver clasificar_tags_lineas) y solo se dejan
+    Implementación Odoo y Soporte y Mantenimiento — Licenciamiento no tiene este
+    seguimiento de actividad comercial."""
+    cols = ["date", "mail_activity_type_id", "user_id", "team_id", "tag_ids"]
+    domain = [
+        ("date", ">=", date_from),
+        ("date", "<=", f"{date_to} 23:59:59"),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    try:
+        df = search_read("crm.activity.report", domain, cols, order="date")
+    except Exception as e:
+        return pd.DataFrame(columns=cols), (
+            f"No se pudo consultar crm.activity.report: {e}. Se intentó con los campos "
+            f"`date`, `mail_activity_type_id`, `user_id`, `team_id`, `tag_ids`."
+        )
+    if df.empty:
+        return df, None
+    tag_names = load_tags().set_index("id")["name"]
+    df["date"] = pd.to_datetime(df["date"])
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["tipo"] = m2o_name(df["mail_activity_type_id"])
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    clasificacion = df["tag_ids"].apply(lambda ids: clasificar_tags_lineas(ids, tag_names))
+    df["linea"] = clasificacion.apply(lambda c: c[0])
+    df = df.explode("linea")
+    df = df[df["linea"].isin(["Implementación Odoo", "Soporte y Mantenimiento"])]
+    return df, None
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando proyecto GC14 (parte de horas TD)...")
 def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
     """Actividades comerciales del equipo TD, EXCLUSIVAMENTE del parte de horas del
@@ -2143,3 +2185,52 @@ with tab_equipo:
                     won_periodo_equipo[["name", "date_closed", "vendedor", "equipo", "expected_revenue"]],
                     use_container_width=True, hide_index=True,
                 )
+
+    st.divider()
+    st.markdown("#### 👥 Actividades del equipo por línea y mes (últimos 12 meses)")
+    st.caption("Fuente: `crm.activity.report` (el reporte estándar de Odoo detrás de "
+              "'CRM > Informes > Actividades'), que sí conserva el histórico completo — a "
+              "diferencia de `mail.activity`, que se borra al marcar la actividad como hecha. "
+              "Solo Implementación Odoo y Soporte y Mantenimiento (Licenciamiento no tiene "
+              "este seguimiento de actividad comercial). No depende del rango del sidebar: "
+              "siempre son los últimos 12 meses.")
+
+    desde_12m_gc = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
+    actividades_crm, err_act_crm = load_crm_activity_report(
+        desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
+    if err_act_crm:
+        st.warning(err_act_crm)
+    elif actividades_crm.empty:
+        st.info("No hay actividades de Implementación Odoo o Soporte y Mantenimiento en "
+                "crm.activity.report para los últimos 12 meses.")
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("Actividades registradas", len(actividades_crm))
+        c2.metric("Tipos distintos", actividades_crm["tipo"].nunique())
+
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            cantidad_linea_mes = (actividades_crm.groupby(["mes", "linea"], as_index=False)
+                                  .agg(cantidad=("tipo", "count")))
+            fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
+                         title="Actividades por línea y mes",
+                         labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_a2:
+            por_tipo_vend = (actividades_crm.groupby(["tipo", "vendedor"], as_index=False)
+                             .agg(cantidad=("mes", "count")))
+            fig = px.bar(por_tipo_vend, x="tipo", y="cantidad", color="vendedor",
+                         barmode="group", title="Actividades por tipo y vendedor",
+                         labels={"cantidad": "Actividades", "tipo": "Tipo"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📋 Detalle de actividades"):
+            st.dataframe(
+                actividades_crm[["date", "linea", "tipo", "vendedor", "equipo"]]
+                    .sort_values("date", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "date": "Fecha", "linea": "Línea", "tipo": "Tipo",
+                    "vendedor": "Vendedor", "equipo": "Equipo",
+                },
+            )
