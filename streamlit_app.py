@@ -105,6 +105,24 @@ def load_teams() -> pd.DataFrame:
     return search_read("crm.team", [], ["id", "name"], order="name")
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando roster de vendedores TD...")
+def load_td_vendedores(team_ids: list[int]) -> pd.DataFrame:
+    """Roster OFICIAL de vendedores de Transformación Digital: los usuarios
+    miembros (Salespersons) de los equipos de venta de TD — crm.team.member_ids,
+    confirmado en odoo/addons/sales_team/models/crm_team.py — no simplemente los
+    nombres que aparecen en los datos ya filtrados por equipo. Se usa para
+    excluir de cualquier tabla/gráfico gerencial a alguien que no sea vendedor de
+    TD (p. ej. si registra horas en un proyecto de TD sin ser del equipo)."""
+    equipos = search_read("crm.team", [("id", "in", team_ids)], ["id", "name", "member_ids"])
+    if equipos.empty:
+        return pd.DataFrame(columns=["user_id", "vendedor"])
+    user_ids = sorted({uid for ids in equipos["member_ids"] for uid in (ids or [])})
+    if not user_ids:
+        return pd.DataFrame(columns=["user_id", "vendedor"])
+    usuarios = search_read("res.users", [("id", "in", user_ids)], ["id", "name"])
+    return usuarios.rename(columns={"id": "user_id", "name": "vendedor"})
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
 def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     domain = [
@@ -195,28 +213,12 @@ def clasificar_tags_lineas(tag_ids: list[int] | None, tag_names: pd.Series) -> t
 MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
-# Códigos de "partes de horas" (hojas de horas estándar de Odoo, account.analytic.line)
-# que el equipo comercial usa para registrar actividad comercial no facturable:
-# presentación de negocio, cotización/propuesta, sustentación de propuesta y
-# seguimiento a cliente. Solo aplican a Implementación Odoo y Soporte y
-# Mantenimiento (Licenciamiento no tiene este seguimiento).
-GC_ACTIVIDAD = {
-    "GC3": "Reunión de presentación de negocio",
-    "GC5": "Cotización / Propuesta",
-    "GC6": "Sustentación de propuesta",
-    "GC8": "Seguimiento Cliente",
-}
-
-
-def _clasificar_gc(*textos: str) -> str | None:
-    """Busca un código GC3/GC5/GC6/GC8 en cualquiera de los textos dados (p. ej. la
-    descripción de la línea de horas y el nombre de la tarea asociada — no sabemos
-    en cuál de los dos vive el código en este Odoo, así que se revisan ambos)."""
-    combinado = _normalizar(" ".join(t for t in textos if t))
-    for codigo in GC_ACTIVIDAD:
-        if codigo in combinado:
-            return codigo
-    return None
+# Nombre (o prefijo) del proyecto de Odoo cuyo parte de horas (account.analytic.line)
+# registra la actividad comercial de los vendedores de TD (presentaciones de
+# negocio, propuestas, sustentaciones, seguimientos, correos...). Las categorías
+# de actividad NO se hardcodean por código — se toman las tareas reales de este
+# proyecto tal como existen en Odoo (ver load_actividades_gc14).
+PROYECTO_PARTE_HORAS_TD = "GC14"
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
@@ -606,18 +608,24 @@ def load_active_support_contracts():
 
 @st.cache_data(ttl=600, show_spinner="Cargando horas vendidas...")
 def load_sold_hours_lines(date_from: str, date_to: str, team_ids: list[int]):
-    """Líneas de sale.order.line cuya unidad de medida es horas (nombre de la
-    UoM contiene 'hora'), de órdenes confirmadas. Se cruza luego con `sales`
-    (ya cargado para el mismo período) para saber mes/vendedor/equipo."""
+    """Líneas de sale.order.line con horas vendidas, de órdenes confirmadas. Dos
+    fuentes posibles de horas en este Odoo (módulo propio `custom_add_hours`):
+    (1) el campo `horas` (custom, en product_template_attribute_value_ids.horas
+    según Complejidad/Tamaño — usado en productos de proyecto tipo Implementación,
+    donde product_uom_qty queda igualado a esas horas pero la UoM del producto NO
+    necesariamente se llama 'Horas'); (2) líneas cuya UoM sí se llama 'Horas' de
+    forma literal (venta simple por horas). Se usa `horas` cuando está poblado y
+    si no se cae a `product_uom_qty`. Se cruza luego con `sales` (ya cargado para
+    el mismo período) para saber mes/vendedor/equipo."""
     domain = [
         ("order_id.date_order", ">=", date_from),
         ("order_id.date_order", "<=", f"{date_to} 23:59:59"),
         ("order_id.state", "in", ["sale", "done"]),
-        ("product_uom_id.name", "ilike", "hora"),
+        "|", ("product_uom_id.name", "ilike", "hora"), ("horas", ">", 0),
     ]
     if team_ids:
         domain.append(("order_id.team_id", "in", team_ids))
-    cols = ["order_id", "product_uom_qty", "product_uom_id"]
+    cols = ["order_id", "product_uom_qty", "product_uom_id", "horas"]
     try:
         df = search_read("sale.order.line", domain, cols)
     except Exception as e:
@@ -625,85 +633,70 @@ def load_sold_hours_lines(date_from: str, date_to: str, team_ids: list[int]):
     if df.empty:
         return df, None
     df["order_id_num"] = m2o_id(df["order_id"])
+    df["horas_vendidas"] = df.apply(
+        lambda r: r["horas"] if r["horas"] else r["product_uom_qty"], axis=1)
     return df, None
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando reporte de actividades CRM...")
-def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
-    """Actividades del equipo desde crm.activity.report — el reporte estándar de
-    Odoo detrás de 'CRM > Informes > Actividades'. Es una vista SQL sobre
-    mail.message (no sobre mail.activity), por eso SÍ conserva el histórico
-    completo de actividades ya completadas y permite una tendencia mensual real.
-    'date' = fecha en que se completó la actividad; 'user_id' = vendedor dueño de
-    la oportunidad (l.user_id), no necesariamente quien registró la actividad;
-    'tag_ids' es un related a lead_id.tag_ids (confirmado en
-    odoo/addons/crm/report/crm_activity_report.py). Se clasifica por línea con las
-    mismas etiquetas de crm.lead (ver clasificar_tags_lineas) y solo se dejan
-    Implementación Odoo y Soporte y Mantenimiento — Licenciamiento no tiene este
-    seguimiento de actividad comercial."""
-    cols = ["date", "mail_activity_type_id", "user_id", "team_id", "tag_ids"]
-    domain = [
-        ("date", ">=", date_from),
-        ("date", "<=", f"{date_to} 23:59:59"),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    try:
-        df = search_read("crm.activity.report", domain, cols, order="date")
-    except Exception as e:
+@st.cache_data(ttl=600, show_spinner="Cargando proyecto GC14 (parte de horas TD)...")
+def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
+    """Actividades comerciales del equipo TD, EXCLUSIVAMENTE del parte de horas del
+    proyecto GC14 (project.project, account.analytic.line.project_id — campo
+    confirmado en odoo/addons/hr_timesheet/models/hr_timesheet.py). No se hardcodea
+    ningún código de actividad: la categoría es el nombre real de la tarea
+    (task_id) dentro de ese proyecto, tal como exista en Odoo — así "Correos"
+    (o cualquier tarea que agreguen después) aparece automáticamente sin tener que
+    tocar el código. El vendedor se resuelve cruzando employee_id → hr.employee
+    .user_id → roster oficial de vendedores TD (load_td_vendedores); cualquier
+    persona que registre horas en GC14 pero no sea vendedor de TD queda excluida."""
+    cols = ["date", "name", "task_id", "employee_id", "unit_amount", "project_id"]
+    proyectos = search_read("project.project", [("name", "ilike", PROYECTO_PARTE_HORAS_TD)], ["id", "name"])
+    if proyectos.empty:
         return pd.DataFrame(columns=cols), (
-            f"No se pudo consultar crm.activity.report: {e}. Se intentó con los campos "
-            f"`date`, `mail_activity_type_id`, `user_id`, `team_id`, `tag_ids`."
+            f"No se encontró ningún proyecto con '{PROYECTO_PARTE_HORAS_TD}' en el nombre "
+            f"(project.project) — verifica el nombre exacto del proyecto de parte de horas "
+            f"de TD en Odoo."
         )
-    if df.empty:
-        return df, None
-    tag_names = load_tags().set_index("id")["name"]
-    df["date"] = pd.to_datetime(df["date"])
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["tipo"] = m2o_name(df["mail_activity_type_id"])
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    clasificacion = df["tag_ids"].apply(lambda ids: clasificar_tags_lineas(ids, tag_names))
-    df["linea"] = clasificacion.apply(lambda c: c[0])
-    df = df.explode("linea")
-    df = df[df["linea"].isin(["Implementación Odoo", "Soporte y Mantenimiento"])]
-    return df, None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando partes de horas del equipo...")
-def load_partes_horas(date_from: str, date_to: str):
-    """Partes de horas del equipo comercial (account.analytic.line, hojas de horas
-    estándar de Odoo), clasificadas por línea de negocio (misma cuenta analítica
-    que los costos, ver LINEA_CUENTA_ANALITICA — por eso solo trae Implementación
-    Odoo y Soporte y Mantenimiento, Licenciamiento no tiene este seguimiento) y por
-    tipo de actividad comercial según el código GC3/GC5/GC6/GC8 (ver GC_ACTIVIDAD),
-    que puede estar en la descripción de la línea o en el nombre de la tarea — se
-    buscan ambos. A diferencia de mail.activity, estos registros SÍ persisten en el
-    tiempo, así que permiten un histórico mensual real (no solo una foto de hoy)."""
-    cols = ["date", "name", "unit_amount", "employee_id", "account_id", "task_id"]
-    cuentas_relevantes = [LINEA_CUENTA_ANALITICA["Implementación Odoo"],
-                          LINEA_CUENTA_ANALITICA["Soporte y Mantenimiento"]]
+    proyecto_ids = proyectos["id"].tolist()
     domain = [
-        ("account_id.name", "in", cuentas_relevantes),
+        ("project_id", "in", proyecto_ids),
         ("date", ">=", date_from),
         ("date", "<=", date_to),
     ]
     try:
-        df = search_read("account.analytic.line", domain, cols)
+        df = search_read("account.analytic.line", domain, cols, order="date")
     except Exception as e:
         return pd.DataFrame(columns=cols), (
-            f"No se pudo consultar partes de horas (account.analytic.line): {e}."
+            f"No se pudo consultar el parte de horas (account.analytic.line) del "
+            f"proyecto {PROYECTO_PARTE_HORAS_TD}: {e}"
         )
     if df.empty:
         return df, None
+
+    roster = load_td_vendedores(team_ids)
+    if roster.empty:
+        return pd.DataFrame(columns=cols), (
+            "No se encontró el roster de vendedores de TD (crm.team.member_ids) para "
+            "cruzar contra el parte de horas."
+        )
+
+    empleado_ids = [i for i in m2o_id(df["employee_id"]).dropna().unique().tolist()]
+    empleados = (search_read("hr.employee", [("id", "in", empleado_ids)], ["id", "user_id"])
+                 if empleado_ids else pd.DataFrame(columns=["id", "user_id"]))
+    if not empleados.empty:
+        empleados["user_id_num"] = m2o_id(empleados["user_id"])
+        empleado_a_user = empleados.set_index("id")["user_id_num"]
+    else:
+        empleado_a_user = pd.Series(dtype=object)
+
     df["date"] = pd.to_datetime(df["date"])
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["linea"] = m2o_name(df["account_id"]).map(CUENTA_ANALITICA_LINEA)
-    df["vendedor"] = m2o_name(df["employee_id"])
-    df["tarea"] = df["task_id"].apply(lambda v: v[1] if isinstance(v, (list, tuple)) else "")
-    df["gc"] = df.apply(lambda r: _clasificar_gc(r["name"], r["tarea"]), axis=1)
-    df["actividad"] = df["gc"].map(GC_ACTIVIDAD)
-    df = df[df["gc"].notna()].copy()
+    df["empleado_id_num"] = m2o_id(df["employee_id"])
+    df["user_id_num"] = df["empleado_id_num"].map(empleado_a_user)
+    df["tarea"] = m2o_name(df["task_id"])
+
+    vendedores_td = roster.set_index("user_id")["vendedor"]
+    df["vendedor"] = df["user_id_num"].map(vendedores_td)
+    df = df[df["vendedor"].notna()].copy()
     return df, None
 
 
@@ -841,12 +834,12 @@ st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
            + (f" · Equipos: {', '.join(team_names)}" if team_names
               else " · Todos los equipos de Transformación Digital"))
 
-(tab_td, tab_ventas, tab_fact, tab_crm, tab_leads, tab_metas, tab_lineas, tab_clientes,
- tab_soporte, tab_rentabilidad, tab_equipo) = st.tabs(
-    ["🏠 Resumen Ejecutivo", "🛒 Ventas", "🧾 Facturación", "🎯 CRM / Pipeline",
-     "📨 Leads y Conversión", "🏆 Metas por vendedor", "🏷️ Metas por línea",
-     "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes", "🛠️ Soporte y Mantenimiento",
-     "💵 Rentabilidad", "🕐 Horas y Actividad del equipo"]
+(tab_td, tab_lineas, tab_metas, tab_fact, tab_ventas, tab_clientes, tab_equipo,
+ tab_rentabilidad, tab_crm, tab_leads, tab_soporte) = st.tabs(
+    ["🏠 Resumen Ejecutivo", "🏷️ Metas por línea", "🏆 Metas por vendedor",
+     "🧾 Facturación", "🛒 Ventas", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes",
+     "🕐 Horas y Actividad del equipo", "💵 Rentabilidad",
+     "🎯 CRM / Pipeline", "📨 Leads y Conversión", "🛠️ Soporte y Mantenimiento"]
 )
 
 # ─────────────────────────────────────────────
@@ -1472,12 +1465,19 @@ with tab_metas:
         c1, c2, c3, c4 = st.columns(4)
         total_meta = con_meta["meta_anual"].sum()
         total_meta_periodo = con_meta["meta_periodo"].sum()
-        total_vendido = con_meta["vendido"].sum()
+        # "Vendido (ganados)" = TODO lo ganado por el equipo en el período (won, sin
+        # duplicar), no solo lo de vendedores con meta — así coincide con el mismo
+        # total en la pestaña "Metas por línea" en vez de sub-contarlo en silencio.
+        total_vendido_equipo = won["expected_revenue"].sum()
+        total_vendido_con_meta = con_meta["vendido"].sum()
         c1.metric("Meta anual (equipo)", fmt_money(total_meta))
         c2.metric(f"Meta del período ({dias_periodo} días)", fmt_money(total_meta_periodo))
-        c3.metric("Vendido (ganados)", fmt_money(total_vendido))
+        c3.metric("Vendido (ganados)", fmt_money(total_vendido_equipo))
         c4.metric("Cumplimiento del período",
-                  f"{total_vendido / total_meta_periodo * 100:.1f}%" if total_meta_periodo else "—")
+                  f"{total_vendido_con_meta / total_meta_periodo * 100:.1f}%" if total_meta_periodo else "—",
+                  help="El % de cumplimiento solo compara vendedores con meta definida "
+                       "contra su propia meta; 'Vendido (ganados)' de arriba sí incluye "
+                       "a todo el equipo, tenga meta o no.")
 
         # Tabla de cumplimiento
         tabla = con_meta[["vendedor", "meta_anual", "meta_periodo", "vendido",
@@ -1579,6 +1579,7 @@ with tab_metas:
 with tab_lineas:
     metas_lineas = load_metas_lineas()
     won_lineas = load_won_lineas(d1, d2, team_ids)
+    won_td = load_won(d1, d2, team_ids)
 
     if metas_lineas.empty:
         st.warning("No se encontró `data/metas_lineas.csv`. Crea el archivo con columnas "
@@ -1613,12 +1614,22 @@ with tab_lineas:
         c1, c2, c3, c4 = st.columns(4)
         total_meta_l = con_meta_l["meta_anual"].sum()
         total_meta_periodo_l = con_meta_l["meta_periodo"].sum()
-        total_vendido_l = con_meta_l["vendido"].sum()
+        # "Vendido (ganados)" = TODO lo ganado por el equipo en el período, tomado de
+        # `won` (una fila por oportunidad, sin duplicar). No se usa la suma de
+        # won_lineas porque esa explota por etiqueta: una oportunidad con más de una
+        # etiqueta de línea se contaría dos veces. Así coincide con el mismo total en
+        # "Metas por vendedor" en vez de sub-contarlo (excluyendo "Sin etiqueta") o
+        # sobre-contarlo (multi-etiqueta) en silencio.
+        total_vendido_equipo_l = won_td["expected_revenue"].sum()
+        total_vendido_con_meta_l = con_meta_l["vendido"].sum()
         c1.metric("Meta anual (todas las líneas)", fmt_money(total_meta_l))
         c2.metric(f"Meta del período ({dias_periodo_l} días)", fmt_money(total_meta_periodo_l))
-        c3.metric("Vendido (ganados)", fmt_money(total_vendido_l))
+        c3.metric("Vendido (ganados)", fmt_money(total_vendido_equipo_l))
         c4.metric("Cumplimiento del período",
-                  f"{total_vendido_l / total_meta_periodo_l * 100:.1f}%" if total_meta_periodo_l else "—")
+                  f"{total_vendido_con_meta_l / total_meta_periodo_l * 100:.1f}%" if total_meta_periodo_l else "—",
+                  help="El % de cumplimiento solo compara líneas con meta definida contra "
+                       "su propia meta; 'Vendido (ganados)' de arriba sí incluye todo lo "
+                       "ganado por el equipo, tenga etiqueta de línea o no.")
 
         tabla_l = con_meta_l[["linea", "meta_anual", "meta_periodo", "vendido",
                               "pct_periodo", "pct_anual"]].copy()
@@ -2020,9 +2031,17 @@ with tab_rentabilidad:
 # TAB: Horas y Actividad del equipo
 # ─────────────────────────────────────────────
 with tab_equipo:
+    roster_td = load_td_vendedores(team_ids)
+
     st.markdown("#### ⏱️ Horas vendidas mes a mes")
-    st.caption("Suma de `product_uom_qty` en líneas de órdenes confirmadas cuya unidad de "
-               "medida es horas, para el rango de fechas del sidebar.")
+    st.caption("Fuente EXCLUSIVA: líneas de Órdenes de Venta del equipo de Transformación "
+               "Digital (sale.order.line, ya acotadas al equipo TD del sidebar). Usa el "
+               "campo `horas` (módulo propio `custom_add_hours`, calculado desde los "
+               "atributos Complejidad/Tamaño del producto — así se venden los proyectos de "
+               "Implementación) cuando está poblado; si no, cae a `product_uom_qty` de "
+               "líneas cuya UoM se llama 'Horas' (venta simple por horas). No se mezclan "
+               "horas de otras fuentes (parte de horas, actividades). Rango de fechas del "
+               "sidebar. El vendedor se restringe además al roster oficial de TD.")
     horas_lineas, err_horas = load_sold_hours_lines(d1, d2, team_ids)
     if err_horas:
         st.warning(err_horas)
@@ -2033,136 +2052,94 @@ with tab_equipo:
             sales[["id", "date_order", "vendedor", "equipo"]],
             left_on="order_id_num", right_on="id", how="inner")
         horas_df["mes"] = horas_df["date_order"].dt.to_period("M").astype(str)
+        if not roster_td.empty:
+            horas_df = horas_df[horas_df["vendedor"].isin(roster_td["vendedor"])]
 
         c1, c2 = st.columns(2)
-        c1.metric("Horas vendidas (período)", f"{horas_df['product_uom_qty'].sum():,.1f} h")
+        c1.metric("Horas vendidas (período)", f"{horas_df['horas_vendidas'].sum():,.1f} h")
         c2.metric("Líneas", len(horas_df))
 
         col_h1, col_h2 = st.columns(2)
         with col_h1:
-            mensual_horas = horas_df.groupby("mes", as_index=False)["product_uom_qty"].sum()
-            fig = px.bar(mensual_horas, x="mes", y="product_uom_qty", text_auto=".1f",
+            mensual_horas = horas_df.groupby("mes", as_index=False)["horas_vendidas"].sum()
+            fig = px.bar(mensual_horas, x="mes", y="horas_vendidas", text_auto=".1f",
                          title="Horas vendidas por mes",
-                         labels={"product_uom_qty": "Horas", "mes": "Mes"})
+                         labels={"horas_vendidas": "Horas", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
         with col_h2:
             mensual_horas_vendedor = (horas_df.groupby(["mes", "vendedor"], as_index=False)
-                                      ["product_uom_qty"].sum())
-            fig = px.bar(mensual_horas_vendedor, x="mes", y="product_uom_qty", color="vendedor",
+                                      ["horas_vendidas"].sum())
+            fig = px.bar(mensual_horas_vendedor, x="mes", y="horas_vendidas", color="vendedor",
                          barmode="group", title="Horas vendidas por vendedor y mes",
-                         labels={"product_uom_qty": "Horas", "mes": "Mes"})
+                         labels={"horas_vendidas": "Horas", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-    st.markdown("#### 📞 Actividades comerciales del equipo por línea y mes (últimos 12 meses)")
-    st.caption("Partes de horas (hojas de horas de Odoo) de actividad comercial no facturable: "
-               "presentación de negocio, cotización/propuesta, sustentación de propuesta y "
-               "seguimiento a cliente. Solo Implementación Odoo y Soporte y Mantenimiento tienen "
-               "este seguimiento (Licenciamiento no). A diferencia del backlog de abajo, esto sí "
-               "es un histórico real mes a mes, porque las horas quedan registradas y no se "
-               "borran como las actividades de mail.activity.")
+    st.markdown("#### 📋 Tabla gerencial: actividades comerciales y oportunidades cerradas — TD")
+    st.caption(
+        f"Dos fuentes independientes, sin mezclar: (1) **Actividades** = parte de horas del "
+        f"proyecto **{PROYECTO_PARTE_HORAS_TD}** (account.analytic.line.project_id) — cada "
+        f"columna de actividad es el nombre REAL de la tarea en ese proyecto, tal como existe "
+        f"en Odoo (no se adivinan códigos). (2) **Oportunidades cerradas** = oportunidades "
+        f"GANADAS (crm.lead.won_status == 'won', fecha de cierre en el rango) — independiente "
+        f"de las actividades, no se confunde con propuestas ni cotizaciones. Ambas se cruzan "
+        f"contra el roster oficial de vendedores de TD (crm.team.member_ids): solo aparecen "
+        f"vendedores de TD, y cualquiera de otra área queda excluido aunque haya registrado "
+        f"horas en el proyecto {PROYECTO_PARTE_HORAS_TD}. Rango de fechas del sidebar."
+    )
 
-    desde_12m_gc = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
-    partes_horas, err_gc = load_partes_horas(desde_12m_gc.isoformat(), hoy.isoformat())
-    if err_gc:
-        st.warning(err_gc)
-    elif partes_horas.empty:
-        st.info("No hay partes de horas con código GC3/GC5/GC6/GC8 en los últimos 12 meses. "
-                "Si el código está en un campo distinto al esperado (descripción de la línea o "
-                "nombre de la tarea), avísame para ajustar la búsqueda.")
+    actividades_gc14, err_gc14 = load_actividades_gc14(d1, d2, team_ids)
+    won_periodo_equipo = load_won(d1, d2, team_ids)
+    if not roster_td.empty and not won_periodo_equipo.empty:
+        won_periodo_equipo = won_periodo_equipo[won_periodo_equipo["vendedor"].isin(roster_td["vendedor"])]
+
+    if roster_td.empty:
+        st.warning("No se encontró el roster de vendedores de TD (crm.team.member_ids) — no "
+                  "se puede armar la tabla sin saber quiénes son los vendedores de TD.")
+    elif err_gc14:
+        st.warning(err_gc14)
     else:
-        c1, c2 = st.columns(2)
-        c1.metric("Partes de horas registrados", len(partes_horas))
-        c2.metric("Horas totales", f"{partes_horas['unit_amount'].sum():,.1f} h")
+        cerradas_vend = (
+            won_periodo_equipo.groupby("vendedor", as_index=False)
+            .agg(**{"Oportunidades cerradas": ("name", "count")})
+            if not won_periodo_equipo.empty
+            else pd.DataFrame(columns=["vendedor", "Oportunidades cerradas"])
+        )
 
-        col_g1, col_g2 = st.columns(2)
-        with col_g1:
-            cantidad_linea_mes = (partes_horas.groupby(["mes", "linea"], as_index=False)
-                                  .agg(cantidad=("unit_amount", "count")))
-            fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
-                         title="Cantidad de actividades por línea y mes",
-                         labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
-        with col_g2:
-            horas_linea_mes = (partes_horas.groupby(["mes", "linea"], as_index=False)
-                               ["unit_amount"].sum())
-            fig = px.bar(horas_linea_mes, x="mes", y="unit_amount", color="linea", barmode="group",
-                         title="Horas invertidas por línea y mes",
-                         labels={"unit_amount": "Horas", "mes": "Mes", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
+        if not actividades_gc14.empty:
+            pivote_act = (actividades_gc14.groupby(["vendedor", "tarea"], as_index=False)
+                          .agg(cantidad=("unit_amount", "count")))
+            tabla_act = pivote_act.pivot(index="vendedor", columns="tarea", values="cantidad")
+        else:
+            tabla_act = pd.DataFrame(index=pd.Index([], name="vendedor"))
+            st.info(f"No hay partes de horas en el proyecto {PROYECTO_PARTE_HORAS_TD} para "
+                   "vendedores de TD en el período seleccionado — la tabla solo mostrará "
+                   "oportunidades cerradas.")
 
-        col_g3, col_g4 = st.columns(2)
-        with col_g3:
-            cantidad_tipo_vend = (partes_horas.groupby(["actividad", "vendedor"], as_index=False)
-                                  .agg(cantidad=("unit_amount", "count")))
-            fig = px.bar(cantidad_tipo_vend, x="actividad", y="cantidad", color="vendedor",
-                         barmode="group", title="Cantidad de actividades por tipo y vendedor",
-                         labels={"cantidad": "Actividades", "actividad": "Tipo de actividad"})
-            st.plotly_chart(fig, use_container_width=True)
-        with col_g4:
-            horas_tipo_vend = (partes_horas.groupby(["actividad", "vendedor"], as_index=False)
-                               ["unit_amount"].sum())
-            fig = px.bar(horas_tipo_vend, x="actividad", y="unit_amount", color="vendedor",
-                         barmode="group", title="Horas por tipo y vendedor",
-                         labels={"unit_amount": "Horas", "actividad": "Tipo de actividad"})
-            st.plotly_chart(fig, use_container_width=True)
+        tabla_final = roster_td[["vendedor"]].merge(
+            tabla_act.reset_index(), on="vendedor", how="left")
+        tabla_final = tabla_final.merge(cerradas_vend, on="vendedor", how="left")
+        cols_numericas = [c for c in tabla_final.columns if c != "vendedor"]
+        tabla_final[cols_numericas] = tabla_final[cols_numericas].fillna(0).astype(int)
+        tabla_final = tabla_final.rename(columns={"vendedor": "Vendedor"})
 
-        with st.expander("📋 Detalle de partes de horas"):
-            st.dataframe(
-                partes_horas[["date", "linea", "actividad", "vendedor", "unit_amount", "name"]]
-                    .sort_values("date", ascending=False),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "date": "Fecha", "linea": "Línea", "actividad": "Tipo de actividad",
-                    "vendedor": "Vendedor",
-                    "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
-                    "name": "Descripción",
-                },
-            )
+        st.dataframe(tabla_final, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown("#### 👥 Actividades del equipo por línea y mes (últimos 12 meses)")
-    st.caption("Fuente: `crm.activity.report` (el reporte estándar de Odoo detrás de "
-              "'CRM > Informes > Actividades'), que sí conserva el histórico completo — a "
-              "diferencia de `mail.activity`, que se borra al marcar la actividad como hecha. "
-              "Solo Implementación Odoo y Soporte y Mantenimiento (Licenciamiento no tiene "
-              "este seguimiento de actividad comercial).")
-
-    actividades_crm, err_act_crm = load_crm_activity_report(
-        desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
-    if err_act_crm:
-        st.warning(err_act_crm)
-    elif actividades_crm.empty:
-        st.info("No hay actividades de Implementación Odoo o Soporte y Mantenimiento en "
-                "crm.activity.report para los últimos 12 meses.")
-    else:
-        c1, c2 = st.columns(2)
-        c1.metric("Actividades registradas", len(actividades_crm))
-        c2.metric("Tipos distintos", actividades_crm["tipo"].nunique())
-
-        col_a1, col_a2 = st.columns(2)
-        with col_a1:
-            cantidad_linea_mes = (actividades_crm.groupby(["mes", "linea"], as_index=False)
-                                  .agg(cantidad=("tipo", "count")))
-            fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
-                         title="Actividades por línea y mes",
-                         labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
-        with col_a2:
-            por_tipo_vend = (actividades_crm.groupby(["tipo", "vendedor"], as_index=False)
-                             .agg(cantidad=("mes", "count")))
-            fig = px.bar(por_tipo_vend, x="tipo", y="cantidad", color="vendedor",
-                         barmode="group", title="Actividades por tipo y vendedor",
-                         labels={"cantidad": "Actividades", "tipo": "Tipo"})
-            st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("📋 Detalle de actividades"):
-            st.dataframe(
-                actividades_crm[["date", "linea", "tipo", "vendedor", "equipo"]]
-                    .sort_values("date", ascending=False),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "date": "Fecha", "linea": "Línea", "tipo": "Tipo",
-                    "vendedor": "Vendedor", "equipo": "Equipo",
-                },
-            )
+        if not actividades_gc14.empty:
+            with st.expander(f"📋 Detalle de partes de horas — proyecto {PROYECTO_PARTE_HORAS_TD}"):
+                st.dataframe(
+                    actividades_gc14[["date", "vendedor", "tarea", "unit_amount", "name"]]
+                        .sort_values("date", ascending=False),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "date": "Fecha", "vendedor": "Vendedor", "tarea": "Tarea (actividad)",
+                        "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
+                        "name": "Descripción",
+                    },
+                )
+        if not won_periodo_equipo.empty:
+            with st.expander("📋 Detalle de oportunidades cerradas (ganadas)"):
+                st.dataframe(
+                    won_periodo_equipo[["name", "date_closed", "vendedor", "equipo", "expected_revenue"]],
+                    use_container_width=True, hide_index=True,
+                )
