@@ -836,10 +836,10 @@ st.caption(f"Período: {date_from:%d/%m/%Y} → {date_to:%d/%m/%Y}"
 
 (tab_td, tab_lineas, tab_metas, tab_fact, tab_ventas, tab_clientes, tab_equipo,
  tab_rentabilidad, tab_crm, tab_leads, tab_soporte) = st.tabs(
-    ["🏠 Resumen Ejecutivo", "🏷️ Metas por línea", "🏆 Metas por vendedor",
-     "🧾 Facturación", "🛒 Ventas", "🧑‍🤝‍🧑 Clientes Nuevos vs. Recurrentes",
-     "🕐 Horas y Actividad del equipo", "💵 Rentabilidad",
-     "🎯 CRM / Pipeline", "📨 Leads y Conversión", "🛠️ Soporte y Mantenimiento"]
+    ["🏠 Resumen", "🏷️ Metas por línea", "🏆 Metas por vendedor",
+     "🧾 Facturación", "🛒 Ventas", "🧑‍🤝‍🧑 Clientes",
+     "🕐 Horas y Actividad", "💵 Rentabilidad",
+     "🎯 CRM / Pipeline", "📨 Leads", "🛠️ Soporte"]
 )
 
 # ─────────────────────────────────────────────
