@@ -2767,3 +2767,76 @@ with tab_equipo:
                          barmode="group", title="Horas por tipo GC y mes",
                          labels={"unit_amount": "Horas", "mes": "Mes", "tipo_brief": "Tipo"})
             st.plotly_chart(fig, use_container_width=True, key="chart_45")
+
+            st.markdown("##### Validación de horas por vendedor")
+            st.caption("Mismas tareas GC3/GC5/GC6/GC8 y los mismos 12 meses. El vendedor "
+                       "sale del empleado que registró el parte de horas, cruzado con el "
+                       "roster TD. Sirve para contrastar quién cargó tiempo y en qué tipo.")
+            vendedores_h = sorted(horas_mapeadas["vendedor"].dropna().unique().tolist())
+            seleccion_h = st.multiselect(
+                "Filtrar vendedores",
+                options=vendedores_h,
+                default=vendedores_h,
+                key="filtro_horas_vendedores",
+            )
+            horas_f = (horas_mapeadas[horas_mapeadas["vendedor"].isin(seleccion_h)]
+                       if seleccion_h else horas_mapeadas.iloc[0:0])
+
+            col_cfg_hv = {"vendedor": "Vendedor", "mes": "Mes"}
+            for tipo in TIPOS_ACTIVIDAD + ["Total"]:
+                col_cfg_hv[tipo] = st.column_config.NumberColumn(tipo, format="%.1f")
+
+            if horas_f.empty:
+                st.info("Selecciona al menos un vendedor para ver las horas.")
+            else:
+                tot_v = horas_f.pivot_table(
+                    index="vendedor", columns="tipo_brief", values="unit_amount",
+                    aggfunc="sum", fill_value=0)
+                for tipo in TIPOS_ACTIVIDAD:
+                    if tipo not in tot_v.columns:
+                        tot_v[tipo] = 0.0
+                tot_v = tot_v[TIPOS_ACTIVIDAD]
+                tot_v["Total"] = tot_v[TIPOS_ACTIVIDAD].sum(axis=1)
+                tot_v = tot_v.sort_values("Total", ascending=False).reset_index()
+                st.markdown("**Acumulado 12 meses por vendedor**")
+                st.dataframe(tot_v, use_container_width=True, hide_index=True,
+                             column_config=col_cfg_hv)
+
+                mes_vend = horas_f.pivot_table(
+                    index=["mes", "vendedor"], columns="tipo_brief",
+                    values="unit_amount", aggfunc="sum", fill_value=0)
+                for tipo in TIPOS_ACTIVIDAD:
+                    if tipo not in mes_vend.columns:
+                        mes_vend[tipo] = 0.0
+                idx_mv = pd.MultiIndex.from_product(
+                    [meses_12, seleccion_h or vendedores_h], names=["mes", "vendedor"])
+                mes_vend = mes_vend.reindex(idx_mv, fill_value=0)
+                mes_vend = mes_vend[TIPOS_ACTIVIDAD]
+                mes_vend["Total"] = mes_vend[TIPOS_ACTIVIDAD].sum(axis=1)
+                mes_vend = mes_vend.reset_index()
+                st.markdown("**Mes a mes por vendedor**")
+                st.dataframe(mes_vend, use_container_width=True, hide_index=True,
+                             column_config=col_cfg_hv)
+
+                horas_mes_vend = (horas_f.groupby(["mes", "vendedor"], as_index=False)
+                                  ["unit_amount"].sum())
+                fig = px.bar(horas_mes_vend, x="mes", y="unit_amount", color="vendedor",
+                             barmode="stack", title="Horas comerciales por vendedor y mes",
+                             labels={"unit_amount": "Horas", "mes": "Mes"})
+                st.plotly_chart(fig, use_container_width=True, key="chart_horas_vendedor")
+
+                with st.expander("📋 Detalle de partes de horas (para validar línea a línea)"):
+                    detalle_h = (horas_f[["date", "vendedor", "tarea", "tipo_brief",
+                                          "unit_amount", "name"]]
+                                 .sort_values(["vendedor", "date"], ascending=[True, False]))
+                    st.dataframe(
+                        detalle_h, use_container_width=True, hide_index=True,
+                        column_config={
+                            "date": "Fecha",
+                            "vendedor": "Vendedor",
+                            "tarea": "Tarea",
+                            "tipo_brief": "Tipo",
+                            "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
+                            "name": "Descripción",
+                        },
+                    )
