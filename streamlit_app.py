@@ -213,12 +213,15 @@ def clasificar_tags_lineas(tag_ids: list[int] | None, tag_names: pd.Series) -> t
 MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
-# Nombre (o prefijo) del proyecto de Odoo cuyo parte de horas (account.analytic.line)
-# registra la actividad comercial de los vendedores de TD (presentaciones de
-# negocio, propuestas, sustentaciones, seguimientos, correos...). Las categorías
-# de actividad NO se hardcodean por código — se toman las tareas reales de este
-# proyecto tal como existen en Odoo (ver load_actividades_gc14).
-PROYECTO_PARTE_HORAS_TD = "GC14"
+# Proyecto de Odoo cuyo parte de horas registra la actividad comercial de TD.
+# GC3/GC5/GC6/GC8 NO son el proyecto: son tareas DENTRO de "Gestión comercial".
+PROYECTO_PARTE_HORAS_TD = "Gestion comercial"
+PROYECTO_PARTE_HORAS_PATRONES = (
+    "gestion comercial GC",
+    "gestión comercial GC",
+    "gestion comercial",
+    "gestión comercial",
+)
 
 # Tipos de actividad comercial que pide el brief (cantidad en crm.activity.report
 # y horas en partes GC3/GC5/GC6/GC8).
@@ -872,24 +875,64 @@ def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     return df, None
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando proyecto GC14 (parte de horas TD)...")
+@st.cache_data(ttl=600, show_spinner="Buscando proyecto Gestión comercial...")
+def load_proyecto_gestion_comercial() -> tuple[pd.DataFrame, str | None]:
+    """Localiza el proyecto de parte de horas comercial. Primero por nombre
+    (Gestión comercial); si no aparece, por las tareas GC3/GC5/GC6/GC8 y el
+    project_id de esas tareas."""
+    vistos: set[int] = set()
+    partes = []
+    for patron in PROYECTO_PARTE_HORAS_PATRONES:
+        hallados = search_read("project.project", [("name", "ilike", patron)], ["id", "name"])
+        if hallados.empty:
+            continue
+        nuevos = hallados[~hallados["id"].isin(vistos)]
+        if not nuevos.empty:
+            vistos.update(int(i) for i in nuevos["id"].tolist())
+            partes.append(nuevos)
+    if partes:
+        return pd.concat(partes, ignore_index=True), None
+
+    domain_tareas: list = []
+    codigos = list(CODIGOS_HORAS_GC.keys())
+    for _ in range(len(codigos) - 1):
+        domain_tareas.append("|")
+    for codigo in codigos:
+        domain_tareas.append(("name", "ilike", codigo))
+    try:
+        tareas = search_read("project.task", domain_tareas, ["id", "name", "project_id"])
+    except Exception as e:
+        return pd.DataFrame(columns=["id", "name"]), (
+            f"No se encontró el proyecto de Gestión comercial ni se pudieron "
+            f"leer las tareas {', '.join(codigos)}: {e}"
+        )
+    if tareas.empty:
+        return pd.DataFrame(columns=["id", "name"]), (
+            "No se encontró el proyecto 'Gestión comercial' (project.project) ni "
+            f"tareas cuyo nombre contenga {', '.join(codigos)}. GC3/GC5/GC6/GC8 "
+            "son tareas dentro de ese proyecto, no el nombre del proyecto."
+        )
+    proyecto_ids = [i for i in m2o_id(tareas["project_id"]).dropna().unique().tolist()]
+    proyectos = search_read("project.project", [("id", "in", proyecto_ids)], ["id", "name"])
+    if proyectos.empty:
+        return pd.DataFrame(columns=["id", "name"]), (
+            "Se encontraron tareas GC3/GC5/GC6/GC8 pero sin proyecto asociado."
+        )
+    return proyectos, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando parte de horas Gestión comercial...")
 def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
-    """Actividades comerciales del equipo TD, EXCLUSIVAMENTE del parte de horas del
-    proyecto GC14 (project.project, account.analytic.line.project_id — campo
-    confirmado en odoo/addons/hr_timesheet/models/hr_timesheet.py). No se hardcodea
-    ningún código de actividad: la categoría es el nombre real de la tarea
-    (task_id) dentro de ese proyecto, tal como exista en Odoo — así "Correos"
-    (o cualquier tarea que agreguen después) aparece automáticamente sin tener que
-    tocar el código. El vendedor se resuelve cruzando employee_id → hr.employee
-    .user_id → roster oficial de vendedores TD (load_td_vendedores); cualquier
-    persona que registre horas en GC14 pero no sea vendedor de TD queda excluida."""
+    """Parte de horas del proyecto Gestión comercial. GC3/GC5/GC6/GC8 son
+    tareas (task_id) dentro de ese proyecto, no el proyecto. El vendedor se
+    cruza employee_id → hr.employee.user_id → roster TD."""
     cols = ["date", "name", "task_id", "employee_id", "unit_amount", "project_id"]
-    proyectos = search_read("project.project", [("name", "ilike", PROYECTO_PARTE_HORAS_TD)], ["id", "name"])
+    proyectos, err_proy = load_proyecto_gestion_comercial()
+    if err_proy:
+        return pd.DataFrame(columns=cols), err_proy
     if proyectos.empty:
         return pd.DataFrame(columns=cols), (
-            f"No se encontró ningún proyecto con '{PROYECTO_PARTE_HORAS_TD}' en el nombre "
-            f"(project.project) — verifica el nombre exacto del proyecto de parte de horas "
-            f"de TD en Odoo."
+            "No se encontró el proyecto de Gestión comercial en Odoo."
         )
     proyecto_ids = proyectos["id"].tolist()
     domain = [
@@ -900,9 +943,10 @@ def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
     try:
         df = search_read("account.analytic.line", domain, cols, order="date")
     except Exception as e:
+        nombres = ", ".join(proyectos["name"].astype(str).tolist())
         return pd.DataFrame(columns=cols), (
             f"No se pudo consultar el parte de horas (account.analytic.line) del "
-            f"proyecto {PROYECTO_PARTE_HORAS_TD}: {e}"
+            f"proyecto {nombres}: {e}"
         )
     if df.empty:
         return df, None
@@ -2539,15 +2583,12 @@ with tab_equipo:
     st.divider()
     st.markdown("#### 📋 Tabla gerencial: actividades comerciales y oportunidades cerradas — TD")
     st.caption(
-        f"Dos fuentes independientes, sin mezclar: (1) **Actividades** = parte de horas del "
-        f"proyecto **{PROYECTO_PARTE_HORAS_TD}** (account.analytic.line.project_id) — cada "
-        f"columna de actividad es el nombre REAL de la tarea en ese proyecto, tal como existe "
-        f"en Odoo (no se adivinan códigos). (2) **Oportunidades cerradas** = oportunidades "
-        f"GANADAS (crm.lead.won_status == 'won', fecha de cierre en el rango) — independiente "
-        f"de las actividades, no se confunde con propuestas ni cotizaciones. Ambas se cruzan "
-        f"contra el roster oficial de vendedores de TD (crm.team.member_ids): solo aparecen "
-        f"vendedores de TD, y cualquiera de otra área queda excluido aunque haya registrado "
-        f"horas en el proyecto {PROYECTO_PARTE_HORAS_TD}. Rango de fechas del sidebar."
+        "Dos fuentes independientes, sin mezclar: (1) **Actividades** = parte de horas del "
+        "proyecto **Gestión comercial** — cada columna es el nombre REAL de la tarea "
+        "(GC3, GC5, GC6, GC8 y las demás que existan). (2) **Oportunidades cerradas** = "
+        "oportunidades GANADAS (crm.lead.won_status == 'won', fecha de cierre en el rango). "
+        "Ambas se cruzan contra el roster oficial de vendedores de TD "
+        "(crm.team.member_ids). Rango de fechas del sidebar."
     )
 
     actividades_gc14, err_gc14 = load_actividades_gc14(d1, d2, team_ids)
@@ -2574,7 +2615,7 @@ with tab_equipo:
             tabla_act = pivote_act.pivot(index="vendedor", columns="tarea", values="cantidad")
         else:
             tabla_act = pd.DataFrame(index=pd.Index([], name="vendedor"))
-            st.info(f"No hay partes de horas en el proyecto {PROYECTO_PARTE_HORAS_TD} para "
+            st.info("No hay partes de horas en el proyecto Gestión comercial para "
                    "vendedores de TD en el período seleccionado — la tabla solo mostrará "
                    "oportunidades cerradas.")
 
@@ -2588,7 +2629,7 @@ with tab_equipo:
         st.dataframe(tabla_final, use_container_width=True, hide_index=True)
 
         if not actividades_gc14.empty:
-            with st.expander(f"📋 Detalle de partes de horas — proyecto {PROYECTO_PARTE_HORAS_TD}"):
+            with st.expander("📋 Detalle de partes de horas — proyecto Gestión comercial"):
                 st.dataframe(
                     actividades_gc14[["date", "vendedor", "tarea", "unit_amount", "name"]]
                         .sort_values("date", ascending=False),
@@ -2686,14 +2727,15 @@ with tab_equipo:
             )
 
     st.markdown("##### Horas comerciales mes a mes (GC3 / GC5 / GC6 / GC8)")
-    st.caption("GC3 presentación de negocio, GC5 cotización/propuesta, GC6 sustentación, "
-               "GC8 seguimiento. Mismas 12 meses. El parte de horas no trae etiqueta CRM.")
+    st.caption("Tareas del proyecto **Gestión comercial** (no son proyectos aparte): "
+               "GC3 presentación de negocio, GC5 cotización/propuesta, GC6 sustentación, "
+               "GC8 seguimiento. Últimos 12 meses. El parte de horas no trae etiqueta CRM.")
     horas_gc14, err_horas_gc = load_actividades_gc14(
         desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
     if err_horas_gc:
         st.warning(err_horas_gc)
     elif horas_gc14.empty:
-        st.info(f"No hay partes de horas en {PROYECTO_PARTE_HORAS_TD} para los últimos 12 meses.")
+        st.info("No hay partes de horas en el proyecto Gestión comercial para los últimos 12 meses.")
     else:
         horas_gc = horas_gc14.copy()
         horas_gc["mes"] = pd.to_datetime(horas_gc["date"]).dt.to_period("M").astype(str)
