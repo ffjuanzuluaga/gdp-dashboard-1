@@ -161,7 +161,7 @@ def load_all_invoices(team_ids: list[int]) -> pd.DataFrame:
         domain.append(("team_id", "in", team_ids))
     df = search_read(
         "account.move", domain,
-        ["invoice_date", "partner_id", "amount_total_signed"],
+        ["invoice_date", "partner_id", "amount_untaxed_signed"],
         order="invoice_date",
     )
     if df.empty:
@@ -220,34 +220,187 @@ MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
 # proyecto tal como existen en Odoo (ver load_actividades_gc14).
 PROYECTO_PARTE_HORAS_TD = "GC14"
 
+# Tipos de actividad comercial que pide el brief (cantidad en crm.activity.report
+# y horas en partes GC3/GC5/GC6/GC8).
+TIPOS_ACTIVIDAD = [
+    "Presentación de negocio",
+    "Propuesta",
+    "Socialización / sustentación",
+    "Seguimiento",
+]
+LINEAS_ACTIVIDAD = ["Implementación Odoo", "Soporte y Mantenimiento"]
+CODIGOS_HORAS_GC = {
+    "GC3": "Presentación de negocio",
+    "GC5": "Propuesta",
+    "GC6": "Socialización / sustentación",
+    "GC8": "Seguimiento",
+}
+CUBOS_CARTERA = [
+    ("al_dia", "Al día"),
+    ("d1_30", "1-30"),
+    ("d31_60", "31-60"),
+    ("d61_90", "61-90"),
+    ("d91_120", "91-120"),
+    ("d120_mas", "+120"),
+]
+
+
+def clasificar_tipo_actividad(nombre: str) -> str:
+    """Mapea mail.activity.type al tipo del brief. Socialización/sustentación
+    se evalúa antes que Propuesta para no tragarse 'sustentación de propuesta'."""
+    n = _normalizar(nombre)
+    if any(k in n for k in ("SOCIALIZ", "SUSTENT")):
+        return "Socialización / sustentación"
+    if "SEGUIMIENTO" in n:
+        return "Seguimiento"
+    if "PRESENTACION" in n or ("REUNION" in n and "NEGOCIO" in n):
+        return "Presentación de negocio"
+    if "PROPUESTA" in n or "COTIZACION" in n:
+        return "Propuesta"
+    return "Otras"
+
+
+def clasificar_tarea_gc(nombre: str) -> str | None:
+    """Clasifica una tarea/cuenta de parte de horas por código GC3/GC5/GC6/GC8."""
+    n = _normalizar(nombre)
+    for codigo, tipo in CODIGOS_HORAS_GC.items():
+        if codigo in n:
+            return tipo
+    return None
+
+
+def cubo_aging(fecha_venc, hoy: date, interval: int = 30) -> str:
+    """Mismos cubos que account_reports.aged_receivable_report (intervalos de 30
+    días, aging por fecha de vencimiento). period0 = Al día (vencimiento >= hoy)."""
+    if pd.isna(fecha_venc):
+        return "al_dia"
+    venc = fecha_venc.date() if hasattr(fecha_venc, "date") else fecha_venc
+    if venc >= hoy:
+        return "al_dia"
+    dias = (hoy - venc).days
+    if dias <= interval:
+        return "d1_30"
+    if dias <= interval * 2:
+        return "d31_60"
+    if dias <= interval * 3:
+        return "d61_90"
+    if dias <= interval * 4:
+        return "d91_120"
+    return "d120_mas"
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando categorías de producto...")
+def load_product_category_ids() -> dict[str, int]:
+    """IDs de product.category por nombre, para filtrar account.invoice.report
+    sin depender de dotted fields en el dominio."""
+    nombres = list(LINEA_CATEGORIA.values())
+    cats = search_read("product.category", [("name", "in", nombres)], ["id", "name"])
+    if cats.empty:
+        return {}
+    return {row["name"]: int(row["id"]) for _, row in cats.iterrows()}
+
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
 def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int]) -> pd.DataFrame:
-    """TODO el historial de líneas de factura de una categoría de producto dada
-    (sin límite de fecha), para poder clasificar la facturación por línea de
-    negocio y saber desde cuándo se le factura a cada cliente."""
+    """Historial de líneas de factura de una categoría, en COP de la compañía y
+    SIN impuestos. Fuente: account.invoice.report.price_subtotal (= -line.balance
+    * rate), no account.move.line.price_subtotal (ese va en moneda del documento
+    y deja el licenciamiento en USD)."""
+    categ_ids = load_product_category_ids()
+    categ_id = categ_ids.get(categoria)
+    if not categ_id:
+        return pd.DataFrame(columns=["date", "partner_id", "monto", "mes",
+                                     "cliente_id", "cliente", "vendedor"])
     domain = [
-        ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
-        ("move_id.state", "=", "posted"),
-        ("product_id.categ_id.name", "=", categoria),
+        ("move_type", "in", ["out_invoice", "out_refund"]),
+        ("state", "=", "posted"),
+        ("product_categ_id", "=", categ_id),
     ]
     if team_ids:
-        domain.append(("move_id.team_id", "in", team_ids))
-    df = search_read(
-        "account.move.line", domain,
-        ["date", "partner_id", "price_subtotal", "move_type"],
-        order="date",
-    )
+        domain.append(("team_id", "in", team_ids))
+    try:
+        df = search_read(
+            "account.invoice.report", domain,
+            ["invoice_date", "partner_id", "invoice_user_id", "team_id", "price_subtotal"],
+            order="invoice_date",
+        )
+    except Exception:
+        # Fallback: balance de la línea está en moneda de la compañía (COP).
+        domain_aml = [
+            ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
+            ("move_id.state", "=", "posted"),
+            ("display_type", "=", "product"),
+            ("product_id.categ_id", "=", categ_id),
+        ]
+        if team_ids:
+            domain_aml.append(("move_id.team_id", "in", team_ids))
+        df = search_read(
+            "account.move.line", domain_aml,
+            ["date", "partner_id", "balance"],
+            order="date",
+        )
+        if df.empty:
+            return df
+        df["invoice_date"] = df["date"]
+        df["invoice_user_id"] = None
+        df["price_subtotal"] = -pd.to_numeric(df["balance"], errors="coerce").fillna(0)
     if df.empty:
         return df
-    df["date"] = pd.to_datetime(df["date"])
-    df["monto"] = df.apply(
-        lambda r: -r["price_subtotal"] if r["move_type"] == "out_refund" else r["price_subtotal"],
-        axis=1,
-    )
+    df["date"] = pd.to_datetime(df["invoice_date"])
+    df["monto"] = pd.to_numeric(df["price_subtotal"], errors="coerce").fillna(0)
     df["mes"] = df["date"].dt.to_period("M").astype(str)
     df["cliente_id"] = m2o_id(df["partner_id"])
     df["cliente"] = m2o_name(df["partner_id"])
+    df["vendedor"] = m2o_name(df["invoice_user_id"])
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando informe de facturas (COP, sin IVA)...")
+def load_invoice_report(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Líneas de account.invoice.report del período, en COP sin impuestos.
+    Sirve para tops de vendedores/clientes por facturado."""
+    domain = [
+        ("move_type", "in", ["out_invoice", "out_refund"]),
+        ("state", "=", "posted"),
+        ("invoice_date", ">=", date_from),
+        ("invoice_date", "<=", date_to),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    try:
+        df = search_read(
+            "account.invoice.report", domain,
+            ["invoice_date", "partner_id", "invoice_user_id", "team_id", "price_subtotal"],
+            order="invoice_date",
+        )
+    except Exception:
+        domain_aml = [
+            ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
+            ("move_id.state", "=", "posted"),
+            ("display_type", "=", "product"),
+            ("date", ">=", date_from),
+            ("date", "<=", date_to),
+        ]
+        if team_ids:
+            domain_aml.append(("move_id.team_id", "in", team_ids))
+        df = search_read(
+            "account.move.line", domain_aml,
+            ["date", "partner_id", "balance"],
+            order="date",
+        )
+        if df.empty:
+            return df
+        df["invoice_date"] = df["date"]
+        df["invoice_user_id"] = None
+        df["team_id"] = None
+        df["price_subtotal"] = -pd.to_numeric(df["balance"], errors="coerce").fillna(0)
+    if df.empty:
+        return df
+    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
+    df["monto"] = pd.to_numeric(df["price_subtotal"], errors="coerce").fillna(0)
+    df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df.columns else "Sin asignar"
+    df["cliente"] = m2o_name(df["partner_id"])
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df.columns else "Sin asignar"
     return df
 
 
@@ -264,18 +417,55 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataF
     df = search_read(
         "account.move",
         domain,
-        ["name", "invoice_date", "partner_id", "invoice_user_id", "team_id",
-         "amount_untaxed_signed", "amount_total_signed", "amount_residual_signed",
-         "payment_state", "move_type"],
+        ["name", "invoice_date", "invoice_date_due", "partner_id", "invoice_user_id",
+         "team_id", "amount_untaxed_signed",
+         "amount_residual_signed", "payment_state", "move_type"],
         order="invoice_date",
     )
     if df.empty:
         return df
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
+    df["invoice_date_due"] = pd.to_datetime(df["invoice_date_due"])
     df["equipo"] = m2o_name(df["team_id"])
     df["vendedor"] = m2o_name(df["invoice_user_id"])
     df["cliente"] = m2o_name(df["partner_id"])
     return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando cartera (Aged Receivable)...")
+def load_aged_receivable(team_ids: list[int], hoy_iso: str):
+    """Cartera vigente con la misma lógica que Contabilidad > Aged Receivable
+    (account_reports.aged_receivable_report): residual de líneas receivable
+    publicadas, aging por date_maturity, cubos de 30 días. Se filtra además por
+    equipo TD (el informe oficial es de toda la compañía)."""
+    cols = ["date", "invoice_date", "date_maturity", "partner_id", "move_id",
+            "amount_residual"]
+    domain = [
+        ("account_id.account_type", "=", "asset_receivable"),
+        ("parent_state", "=", "posted"),
+        ("amount_residual", "!=", 0),
+    ]
+    if team_ids:
+        domain.append(("move_id.team_id", "in", team_ids))
+    try:
+        df = search_read("account.move.line", domain, cols)
+    except Exception as e:
+        return pd.DataFrame(columns=cols), (
+            f"No se pudo consultar cartera (líneas receivable, misma lógica que "
+            f"`account_reports.aged_receivable_report`): {e}"
+        )
+    if df.empty:
+        return df, None
+    hoy_d = date.fromisoformat(hoy_iso)
+    df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
+    df["date_maturity"] = pd.to_datetime(df["date_maturity"], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["vencimiento"] = df["date_maturity"].fillna(df["date"])
+    df["saldo"] = pd.to_numeric(df["amount_residual"], errors="coerce").fillna(0)
+    df["cubo"] = df["vencimiento"].apply(lambda v: cubo_aging(v, hoy_d))
+    df["cliente"] = m2o_name(df["partner_id"])
+    df["factura"] = m2o_name(df["move_id"])
+    return df, None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando pipeline CRM...")
@@ -514,7 +704,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
         domain.append(("team_id", "in", team_ids))
     df = search_read(
         "crm.lead", domain,
-        ["name", "create_date", "user_id", "team_id", "medium_id",
+        ["name", "create_date", "user_id", "team_id", "medium_id", "source_id",
          "expected_revenue", "probability", "active", "type", "won_status"],
         order="create_date",
     )
@@ -525,6 +715,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
+    df["origen"] = m2o_name(df["source_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
     return df
 
@@ -671,12 +862,13 @@ def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     df["date"] = pd.to_datetime(df["date"])
     df["mes"] = df["date"].dt.to_period("M").astype(str)
     df["tipo"] = m2o_name(df["mail_activity_type_id"])
+    df["tipo_brief"] = df["tipo"].apply(clasificar_tipo_actividad)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     clasificacion = df["tag_ids"].apply(lambda ids: clasificar_tags_lineas(ids, tag_names))
     df["linea"] = clasificacion.apply(lambda c: c[0])
     df = df.explode("linea")
-    df = df[df["linea"].isin(["Implementación Odoo", "Soporte y Mantenimiento"])]
+    df = df[df["linea"].isin(LINEAS_ACTIVIDAD)]
     return df, None
 
 
@@ -739,6 +931,7 @@ def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
     vendedores_td = roster.set_index("user_id")["vendedor"]
     df["vendedor"] = df["user_id_num"].map(vendedores_td)
     df = df[df["vendedor"].notna()].copy()
+    df["tipo_brief"] = df["tarea"].apply(clasificar_tarea_gc)
     return df, None
 
 
@@ -815,6 +1008,36 @@ def fmt_miles_apostrofe(v: float) -> str:
     """Valor en miles de pesos, con apóstrofe como separador (p. ej. 40'463 para
     $40.463.000), al estilo de notación informal colombiana."""
     return f"{v / 1000:,.0f}".replace(",", "'")
+
+
+def meses_ultimos_n(hoy: date, n: int = 12) -> list[str]:
+    periodo = pd.Period(hoy, freq="M")
+    return [(periodo - i).strftime("%Y-%m") for i in range(n - 1, -1, -1)]
+
+
+def tabla_actividades_mes_a_mes(df: pd.DataFrame, extra: str, meses: list[str],
+                                 extras: list[str] | None = None) -> pd.DataFrame:
+    """Pivote mes × extra × 4 tipos del brief, con los 12 meses aunque vayan en 0."""
+    brief = df[df["tipo_brief"].isin(TIPOS_ACTIVIDAD)] if not df.empty else df
+    if extras is None:
+        extras = (sorted(brief[extra].dropna().unique().tolist())
+                  if not brief.empty and extra in brief.columns else [])
+    if not extras:
+        extras = ["—"]
+    idx = pd.MultiIndex.from_product([meses, extras], names=["mes", extra])
+    if brief.empty:
+        piv = pd.DataFrame(0, index=idx, columns=TIPOS_ACTIVIDAD)
+    else:
+        conteo = (brief.groupby(["mes", extra, "tipo_brief"], as_index=False)
+                  .agg(cantidad=("tipo", "count")))
+        piv = conteo.pivot_table(index=["mes", extra], columns="tipo_brief",
+                                 values="cantidad", aggfunc="sum", fill_value=0)
+        for tipo in TIPOS_ACTIVIDAD:
+            if tipo not in piv.columns:
+                piv[tipo] = 0
+        piv = piv[TIPOS_ACTIVIDAD].reindex(idx, fill_value=0)
+    piv["Total"] = piv[TIPOS_ACTIVIDAD].sum(axis=1)
+    return piv.reset_index()
 
 
 # ─────────────────────────────────────────────
@@ -1049,6 +1272,89 @@ with tab_td:
         st.caption("💡 Rentabilidad por línea (facturado vs. costos del equipo) está en la "
                   "pestaña **💵 Rentabilidad**.")
 
+        st.divider()
+        st.markdown("#### 🏅 Top 10 vendedores y clientes")
+        st.caption("Facturado = `account.invoice.report` en COP sin IVA. CRM ganados = "
+                   "oportunidades `won` del año (cantidad y valor esperado).")
+        fact_anio_top = load_invoice_report(f"{anio_td}-01-01", f"{anio_td}-12-31", team_ids)
+        won_anio_top = load_won(f"{anio_td}-01-01", f"{anio_td}-12-31", team_ids)
+
+        col_tv1, col_tv2 = st.columns(2)
+        with col_tv1:
+            if fact_anio_top.empty:
+                st.info("No hay facturación en el año.")
+            else:
+                top_v_fact = (fact_anio_top.groupby("vendedor", as_index=False)["monto"]
+                              .sum().sort_values("monto", ascending=False).head(10))
+                fig = px.bar(top_v_fact.sort_values("monto"), x="monto", y="vendedor",
+                             orientation="h", title=f"Top 10 vendedores por facturado — {anio_td}",
+                             text_auto=".2s", labels={"monto": "COP sin IVA", "vendedor": ""})
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    top_v_fact, use_container_width=True, hide_index=True,
+                    column_config={
+                        "vendedor": "Vendedor",
+                        "monto": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    },
+                )
+        with col_tv2:
+            if won_anio_top.empty:
+                st.info("No hay CRM ganados en el año.")
+            else:
+                top_v_crm = (won_anio_top.groupby("vendedor", as_index=False)
+                             .agg(ganados=("name", "count"), valor=("expected_revenue", "sum"))
+                             .sort_values("ganados", ascending=False).head(10))
+                fig = px.bar(top_v_crm.sort_values("ganados"), x="ganados", y="vendedor",
+                             orientation="h", title=f"Top 10 vendedores por CRM ganados — {anio_td}",
+                             text_auto=True, labels={"ganados": "Oportunidades", "vendedor": ""})
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    top_v_crm, use_container_width=True, hide_index=True,
+                    column_config={
+                        "vendedor": "Vendedor",
+                        "ganados": "Ganados",
+                        "valor": st.column_config.NumberColumn("Valor CRM", format="$%,.0f"),
+                    },
+                )
+
+        col_tc1, col_tc2 = st.columns(2)
+        with col_tc1:
+            if fact_anio_top.empty:
+                st.info("No hay facturación en el año.")
+            else:
+                top_c_fact = (fact_anio_top.groupby("cliente", as_index=False)["monto"]
+                              .sum().sort_values("monto", ascending=False).head(10))
+                fig = px.bar(top_c_fact.sort_values("monto"), x="monto", y="cliente",
+                             orientation="h", title=f"Top 10 clientes por facturado — {anio_td}",
+                             text_auto=".2s", labels={"monto": "COP sin IVA", "cliente": ""})
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    top_c_fact, use_container_width=True, hide_index=True,
+                    column_config={
+                        "cliente": "Cliente",
+                        "monto": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    },
+                )
+        with col_tc2:
+            if won_anio_top.empty:
+                st.info("No hay CRM ganados en el año.")
+            else:
+                top_c_crm = (won_anio_top.groupby("cliente", as_index=False)
+                             .agg(ganados=("name", "count"), valor=("expected_revenue", "sum"))
+                             .sort_values("ganados", ascending=False).head(10))
+                fig = px.bar(top_c_crm.sort_values("ganados"), x="ganados", y="cliente",
+                             orientation="h", title=f"Top 10 clientes por CRM ganados — {anio_td}",
+                             text_auto=True, labels={"ganados": "Oportunidades", "cliente": ""})
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    top_c_crm, use_container_width=True, hide_index=True,
+                    column_config={
+                        "cliente": "Cliente",
+                        "ganados": "Ganados",
+                        "valor": st.column_config.NumberColumn("Valor CRM", format="$%,.0f"),
+                    },
+                )
+
 # ─────────────────────────────────────────────
 # TAB 1: Ventas (sale.order)
 # ─────────────────────────────────────────────
@@ -1139,53 +1445,125 @@ with tab_ventas:
             st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────────────
-# TAB 2: Facturación (account.move)
+# TAB 2: Facturación (account.move + Aged Receivable)
 # ─────────────────────────────────────────────
 with tab_fact:
+    st.caption("Facturación **antes de impuestos** (`amount_untaxed_signed` / "
+               "`account.invoice.report.price_subtotal`, COP de la compañía). "
+               "La cartera usa la misma lógica que Contabilidad → Aged Receivable "
+               "(`account_reports.aged_receivable_report`): residual de líneas "
+               "receivable, cubos de 30 días por fecha de vencimiento. El saldo "
+               "de cartera incluye IVA (lo que el cliente debe); no se compara 1:1 "
+               "con lo facturado sin impuestos.")
+
     if invoices.empty:
         st.info("No hay facturas publicadas en el período seleccionado.")
     else:
-        facturado = invoices["amount_total_signed"].sum()
-        pendiente = invoices["amount_residual_signed"].sum()
+        facturado = invoices["amount_untaxed_signed"].sum()
+        pagado_periodo = invoices.loc[
+            invoices["payment_state"].isin(["paid", "reversed"]),
+            "amount_untaxed_signed"].sum()
         nc = (invoices["move_type"] == "out_refund").sum()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Documentos", len(invoices))
-        c2.metric("Facturado neto", fmt_money(facturado))
-        c3.metric("Cartera pendiente", fmt_money(pendiente))
+        c2.metric("Facturado neto (sin IVA)", fmt_money(facturado))
+        c3.metric("Pagado del período (sin IVA)", fmt_money(pagado_periodo),
+                  help="Facturas/NC del rango del sidebar con payment_state "
+                       "pagada o revertida. No entra en Aged Receivable.")
         c4.metric("Notas crédito", int(nc))
 
         col_a, col_b = st.columns(2)
         with col_a:
-            por_equipo = (invoices.groupby("equipo", as_index=False)["amount_total_signed"]
-                          .sum().sort_values("amount_total_signed", ascending=False))
-            fig = px.bar(por_equipo, x="equipo", y="amount_total_signed",
-                         title="Facturación neta por equipo", text_auto=".2s",
-                         labels={"amount_total_signed": "Total", "equipo": "Equipo"})
+            por_equipo = (invoices.groupby("equipo", as_index=False)["amount_untaxed_signed"]
+                          .sum().sort_values("amount_untaxed_signed", ascending=False))
+            fig = px.bar(por_equipo, x="equipo", y="amount_untaxed_signed",
+                         title="Facturación neta por equipo (sin IVA)", text_auto=".2s",
+                         labels={"amount_untaxed_signed": "COP", "equipo": "Equipo"})
             st.plotly_chart(fig, use_container_width=True)
         with col_b:
-            estado_pago = (invoices.groupby("payment_state", as_index=False)["amount_total_signed"]
-                           .sum())
-            etiquetas = {"not_paid": "No pagada", "in_payment": "En pago",
-                         "paid": "Pagada", "partial": "Parcial", "reversed": "Revertida"}
-            estado_pago["estado"] = estado_pago["payment_state"].map(etiquetas).fillna(estado_pago["payment_state"])
-            fig = px.pie(estado_pago, names="estado", values="amount_total_signed",
-                         title="Distribución por estado de pago", hole=0.45)
+            mensual = (invoices.assign(mes=invoices["invoice_date"].dt.to_period("M").astype(str))
+                       .groupby(["mes", "equipo"], as_index=False)["amount_untaxed_signed"].sum())
+            fig = px.bar(mensual, x="mes", y="amount_untaxed_signed", color="equipo",
+                         barmode="group", title="Facturación mensual por equipo (sin IVA)",
+                         labels={"amount_untaxed_signed": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
-        mensual = (invoices.assign(mes=invoices["invoice_date"].dt.to_period("M").astype(str))
-                   .groupby(["mes", "equipo"], as_index=False)["amount_total_signed"].sum())
-        fig = px.bar(mensual, x="mes", y="amount_total_signed", color="equipo",
-                     barmode="group", title="Facturación mensual por equipo",
-                     labels={"amount_total_signed": "Total", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("📋 Detalle de facturas"):
+        with st.expander("📋 Detalle de facturas del período"):
             st.dataframe(
-                invoices[["name", "invoice_date", "cliente", "vendedor", "equipo",
-                          "amount_total_signed", "amount_residual_signed", "payment_state"]],
+                invoices[["name", "invoice_date", "invoice_date_due", "cliente",
+                          "vendedor", "equipo", "amount_untaxed_signed",
+                          "amount_residual_signed", "payment_state"]],
                 use_container_width=True, hide_index=True,
+                column_config={
+                    "name": "Factura",
+                    "invoice_date": "Fecha",
+                    "invoice_date_due": "Vencimiento",
+                    "amount_untaxed_signed": st.column_config.NumberColumn(
+                        "Facturado (sin IVA)", format="$%,.0f"),
+                    "amount_residual_signed": st.column_config.NumberColumn(
+                        "Saldo", format="$%,.0f"),
+                    "payment_state": "Estado de pago",
+                },
             )
+
+    st.markdown("#### 📂 Cartera vigente — Aged Receivable")
+    st.caption("Saldos abiertos a hoy (no el rango del sidebar). Al día = por "
+               "pagar en tiempo (vencimiento ≥ hoy). 1-30 … +120 = vencido por "
+               "antigüedad. Las facturas ya pagadas no aparecen.")
+    cartera, err_cartera = load_aged_receivable(team_ids, hoy.isoformat())
+    if err_cartera:
+        st.warning(err_cartera)
+    elif cartera.empty:
+        st.info("No hay cartera abierta de Transformación Digital.")
+    else:
+        labels_cubo = dict(CUBOS_CARTERA)
+        cartera_tabla = (cartera.groupby(["cliente", "factura", "invoice_date",
+                                          "vencimiento", "cubo"], as_index=False)["saldo"].sum())
+        pivote_c = (cartera_tabla.pivot_table(
+            index=["cliente", "factura", "invoice_date", "vencimiento"],
+            columns="cubo", values="saldo", aggfunc="sum", fill_value=0)
+            .reset_index())
+        for key, _nombre in CUBOS_CARTERA:
+            if key not in pivote_c.columns:
+                pivote_c[key] = 0.0
+        pivote_c["total"] = sum(pivote_c[k] for k, _n in CUBOS_CARTERA)
+        pivote_c = pivote_c.sort_values("total", ascending=False)
+
+        al_dia = float(cartera.loc[cartera["cubo"] == "al_dia", "saldo"].sum())
+        vencido = float(cartera.loc[cartera["cubo"] != "al_dia", "saldo"].sum())
+        vigente = al_dia + vencido
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Cartera vigente", fmt_money(vigente))
+        k2.metric("Al día (por pagar en tiempo)", fmt_money(al_dia))
+        k3.metric("Vencido", fmt_money(vencido))
+
+        col_cfg_c = {
+            "cliente": "Cliente",
+            "factura": "Factura",
+            "invoice_date": "Fecha factura",
+            "vencimiento": "Vencimiento",
+            "total": st.column_config.NumberColumn("Total", format="$%,.0f"),
+        }
+        mostrar = pivote_c[["cliente", "factura", "invoice_date", "vencimiento"]
+                           + [k for k, _n in CUBOS_CARTERA] + ["total"]]
+        rename_c = {k: n for k, n in CUBOS_CARTERA}
+        mostrar = mostrar.rename(columns=rename_c)
+        for _k, nombre in CUBOS_CARTERA:
+            col_cfg_c[nombre] = st.column_config.NumberColumn(nombre, format="$%,.0f")
+        st.dataframe(mostrar, use_container_width=True, hide_index=True,
+                     column_config=col_cfg_c)
+
+        cubos_sum = (cartera.groupby("cubo", as_index=False)["saldo"].sum())
+        cubos_sum["cubo"] = cubos_sum["cubo"].map(labels_cubo).fillna(cubos_sum["cubo"])
+        orden_cubos = [n for _k, n in CUBOS_CARTERA]
+        cubos_sum["cubo"] = pd.Categorical(cubos_sum["cubo"], orden_cubos, ordered=True)
+        cubos_sum = cubos_sum.sort_values("cubo")
+        fig = px.bar(cubos_sum, x="cubo", y="saldo", text_auto=".2s",
+                     title="Cartera por antigüedad (Aged Receivable)",
+                     labels={"cubo": "Cubo", "saldo": "COP"})
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     st.markdown("### 🎯 Cumplimiento Meta vs. Vendido vs. Facturado por línea de negocio")
@@ -1385,46 +1763,66 @@ with tab_leads:
                    "cierre**, no por fecha de creación: incluyen oportunidades que venías "
                    "trabajando desde antes del período y que se cerraron ahora. \"Leads "
                    "creados\" sí es estrictamente por fecha de creación, así que ambos "
-                   "números no son necesariamente el mismo grupo de registros.")
+                   "números no son necesariamente el mismo grupo de registros. Incluye "
+                   "archivados.")
 
         if not leads_full.empty:
+            # Regla de la dueña del proceso: tasa = ganadas (fecha de cierre) / leads creados.
+            leads_x_vend = leads_full.groupby("vendedor", as_index=False).agg(leads=("name", "count"))
+            ganadas_x_vend = (closed[closed["estado"] == "Ganada"]
+                               .groupby("vendedor", as_index=False).agg(ganadas=("name", "count"))
+                               if not closed.empty else pd.DataFrame(columns=["vendedor", "ganadas"]))
+            conv_vendedor = leads_x_vend.merge(ganadas_x_vend, on="vendedor", how="left")
+            conv_vendedor["ganadas"] = conv_vendedor["ganadas"].fillna(0).astype(int)
+            conv_vendedor["leads"] = conv_vendedor["leads"].astype(int)
+            conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
+                lambda r: r["ganadas"] / r["leads"] * 100 if r["leads"] else 0, axis=1)
+            conv_vendedor = conv_vendedor.sort_values("leads", ascending=False)
+            st.markdown("#### Leads y cierres por vendedor (números, no valores)")
+            st.dataframe(
+                conv_vendedor, use_container_width=True, hide_index=True,
+                column_config={
+                    "vendedor": "Vendedor",
+                    "leads": "Leads creados",
+                    "ganadas": "Cierres ganados",
+                    "tasa_conversion": st.column_config.ProgressColumn(
+                        "% conversión", format="%.1f%%", min_value=0, max_value=100),
+                },
+            )
+
             mensual_vendedor = (leads_full.groupby(["mes", "vendedor"], as_index=False)
                                 .agg(leads=("name", "count")))
             fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
-                         barmode="group", title="Leads creados por vendedor y mes",
+                         barmode="stack", title="Leads mensuales por vendedor (apilado)",
                          labels={"leads": "Leads", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
+            mensual_origen = (leads_full.groupby(["mes", "origen"], as_index=False)
+                              .agg(leads=("name", "count")))
+            fig = px.bar(mensual_origen, x="mes", y="leads", color="origen",
+                         barmode="stack", title="Leads mensuales por origen (incluye archivados)",
+                         labels={"leads": "Leads", "mes": "Mes", "origen": "Origen"})
             st.plotly_chart(fig, use_container_width=True)
 
             mensual_medio = (leads_full.groupby(["mes", "medio"], as_index=False)
                              .agg(leads=("name", "count")))
             fig = px.bar(mensual_medio, x="mes", y="leads", color="medio",
-                         barmode="group", title="Leads creados por medio y mes",
+                         barmode="stack", title="Leads creados por medio y mes",
                          labels={"leads": "Leads", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
         col_a, col_b = st.columns(2)
         with col_a:
             if not leads_full.empty:
-                por_medio = (leads_full.groupby("medio", as_index=False)
-                             .agg(leads=("name", "count"))
-                             .sort_values("leads", ascending=True).tail(10))
-                fig = px.bar(por_medio, x="leads", y="medio", orientation="h",
-                             title="Leads creados por medio", text_auto=True,
-                             labels={"leads": "Leads", "medio": ""})
+                por_origen = (leads_full.groupby("origen", as_index=False)
+                              .agg(leads=("name", "count"))
+                              .sort_values("leads", ascending=True).tail(10))
+                fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
+                             title="Leads creados por origen", text_auto=True,
+                             labels={"leads": "Leads", "origen": ""})
                 st.plotly_chart(fig, use_container_width=True)
         with col_b:
             if not leads_full.empty:
-                # Regla de la dueña del proceso: tasa de conversión = ganadas (cerradas
-                # GANADAS en el período, por fecha de cierre) / leads creados en el
-                # período (por fecha de creación) — no ganadas/cerradas.
-                leads_x_vend = leads_full.groupby("vendedor", as_index=False).agg(leads=("name", "count"))
-                ganadas_x_vend = (closed[closed["estado"] == "Ganada"]
-                                   .groupby("vendedor", as_index=False).agg(ganadas=("name", "count"))
-                                   if not closed.empty else pd.DataFrame(columns=["vendedor", "ganadas"]))
-                conv_vendedor = leads_x_vend.merge(ganadas_x_vend, on="vendedor", how="left")
-                conv_vendedor["ganadas"] = conv_vendedor["ganadas"].fillna(0)
-                conv_vendedor["tasa_conversion"] = conv_vendedor.apply(
-                    lambda r: r["ganadas"] / r["leads"] * 100 if r["leads"] else 0, axis=1)
                 fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
                              x="tasa_conversion", y="vendedor", orientation="h",
                              title="Tasa de conversión por vendedor (ganadas / leads creados)",
@@ -1455,8 +1853,8 @@ with tab_leads:
         if not leads_full.empty:
             with st.expander("📋 Detalle de leads creados en el período"):
                 st.dataframe(
-                    leads_full[["name", "create_date", "vendedor", "equipo", "medio",
-                                "estado", "expected_revenue"]],
+                    leads_full[["name", "create_date", "vendedor", "equipo", "origen",
+                                "medio", "estado", "expected_revenue"]],
                     use_container_width=True, hide_index=True,
                 )
         if not closed.empty:
@@ -1791,7 +2189,7 @@ with tab_clientes:
             st.info("No hay facturas publicadas en el período seleccionado.")
         else:
             resumen = (fact_periodo.groupby(["cliente_id", "cliente"], as_index=False)
-                      ["amount_total_signed"].sum())
+                      ["amount_untaxed_signed"].sum())
             resumen = resumen.merge(primera_factura, on="cliente_id", how="left")
             resumen["segmento"] = resumen["primera_factura"].apply(
                 lambda d: "Nuevo" if d.date() >= date_from else "Recurrente")
@@ -1819,8 +2217,8 @@ with tab_clientes:
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
                 st.plotly_chart(fig, use_container_width=True)
             with col_b:
-                fact_seg = resumen.groupby("segmento", as_index=False)["amount_total_signed"].sum()
-                fig = px.pie(fact_seg, names="segmento", values="amount_total_signed",
+                fact_seg = resumen.groupby("segmento", as_index=False)["amount_untaxed_signed"].sum()
+                fig = px.pie(fact_seg, names="segmento", values="amount_untaxed_signed",
                             title="Facturación del período: nuevos vs. recurrentes", hole=0.45,
                             color="segmento",
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
@@ -1829,12 +2227,12 @@ with tab_clientes:
             st.markdown("#### Comparativo de facturación: nuevos vs. recurrentes")
             orden_segmento = {"Nuevo": 0, "Recurrente": 1}
             fact_seg_tabla = fact_seg.sort_values(by="segmento", key=lambda s: s.map(orden_segmento))
-            total_fact = fact_seg_tabla["amount_total_signed"].sum()
+            total_fact = fact_seg_tabla["amount_untaxed_signed"].sum()
             fact_seg_tabla["pct_total"] = (
-                fact_seg_tabla["amount_total_signed"] / total_fact * 100 if total_fact else 0.0)
+                fact_seg_tabla["amount_untaxed_signed"] / total_fact * 100 if total_fact else 0.0)
             fila_total = pd.DataFrame([{
                 "segmento": "Total",
-                "amount_total_signed": total_fact,
+                "amount_untaxed_signed": total_fact,
                 "pct_total": 100.0 if total_fact else 0.0,
             }])
             tabla_comp = pd.concat([fact_seg_tabla, fila_total], ignore_index=True)
@@ -1843,19 +2241,19 @@ with tab_clientes:
                 use_container_width=True, hide_index=True,
                 column_config={
                     "segmento": "Segmento",
-                    "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                    "amount_untaxed_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
                     "pct_total": st.column_config.NumberColumn("% del total", format="%.1f%%"),
                 },
             )
 
             with st.expander(f"📋 Clientes NUEVOS en el período ({len(nuevos)})"):
                 st.dataframe(
-                    nuevos[["cliente", "amount_total_signed"]]
-                        .sort_values("amount_total_signed", ascending=False),
+                    nuevos[["cliente", "amount_untaxed_signed"]]
+                        .sort_values("amount_untaxed_signed", ascending=False),
                     use_container_width=True, hide_index=True,
                     column_config={
                         "cliente": "Cliente",
-                        "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                        "amount_untaxed_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
                     },
                 )
             with st.expander(f"📋 Clientes RECURRENTES en el período ({len(recurrentes)})"):
@@ -1866,46 +2264,65 @@ with tab_clientes:
                 ).round(1)
                 st.dataframe(
                     recurrentes_tabla[["cliente", "cliente_desde", "antiguedad_anios",
-                                       "amount_total_signed"]]
-                        .sort_values("amount_total_signed", ascending=False),
+                                       "amount_untaxed_signed"]]
+                        .sort_values("amount_untaxed_signed", ascending=False),
                     use_container_width=True, hide_index=True,
                     column_config={
                         "cliente": "Cliente",
                         "cliente_desde": "Cliente desde",
                         "antiguedad_anios": "Antigüedad (años)",
-                        "amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                        "amount_untaxed_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
                     },
                 )
 
     st.divider()
-    st.markdown("#### 🏆 Top clientes del año")
+    st.markdown("#### 🏆 Top 10 clientes del año: facturado y CRM ganados")
+    st.caption("Facturado en COP sin IVA (`account.invoice.report`). CRM = oportunidades ganadas.")
     anio_top_clientes = st.selectbox("Año a analizar", options=range(hoy.year, hoy.year - 4, -1),
                                      index=0, key="anio_top_clientes")
-    sales_anio = load_sales(f"{anio_top_clientes}-01-01", f"{anio_top_clientes}-12-31", team_ids)
+    fact_anio_cli = load_invoice_report(
+        f"{anio_top_clientes}-01-01", f"{anio_top_clientes}-12-31", team_ids)
     won_anio = load_won(f"{anio_top_clientes}-01-01", f"{anio_top_clientes}-12-31", team_ids)
 
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        if sales_anio.empty:
-            st.info(f"No hay ventas en {anio_top_clientes}.")
+        if fact_anio_cli.empty:
+            st.info(f"No hay facturación en {anio_top_clientes}.")
         else:
-            top_ventas_anio = (sales_anio.groupby("cliente", as_index=False)["amount_total"]
-                               .sum().sort_values("amount_total", ascending=True).tail(10))
-            fig = px.bar(top_ventas_anio, x="amount_total", y="cliente", orientation="h",
-                         title=f"Top 10 clientes por ventas — {anio_top_clientes}", text_auto=".2s",
-                         labels={"amount_total": "Total", "cliente": ""})
+            top_ventas_anio = (fact_anio_cli.groupby("cliente", as_index=False)["monto"]
+                               .sum().sort_values("monto", ascending=True).tail(10))
+            fig = px.bar(top_ventas_anio, x="monto", y="cliente", orientation="h",
+                         title=f"Top 10 clientes por facturado — {anio_top_clientes}", text_auto=".2s",
+                         labels={"monto": "COP sin IVA", "cliente": ""})
             st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(
+                top_ventas_anio.sort_values("monto", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "cliente": "Cliente",
+                    "monto": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+                },
+            )
     with col_t2:
         if won_anio.empty:
             st.info(f"No hay oportunidades ganadas en {anio_top_clientes}.")
         else:
             top_oport_anio = (won_anio.groupby("cliente", as_index=False)
-                              .agg(oportunidades=("name", "count"))
-                              .sort_values("oportunidades", ascending=True).tail(10))
-            fig = px.bar(top_oport_anio, x="oportunidades", y="cliente", orientation="h",
-                         title=f"Top 10 clientes por oportunidades ganadas — {anio_top_clientes}",
-                         text_auto=True, labels={"oportunidades": "Oportunidades", "cliente": ""})
+                              .agg(ganados=("name", "count"), valor=("expected_revenue", "sum"))
+                              .sort_values("ganados", ascending=True).tail(10))
+            fig = px.bar(top_oport_anio, x="ganados", y="cliente", orientation="h",
+                         title=f"Top 10 clientes por CRM ganados — {anio_top_clientes}",
+                         text_auto=True, labels={"ganados": "Oportunidades", "cliente": ""})
             st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(
+                top_oport_anio.sort_values("ganados", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "cliente": "Cliente",
+                    "ganados": "Ganados",
+                    "valor": st.column_config.NumberColumn("Valor CRM", format="$%,.0f"),
+                },
+            )
 
 # ─────────────────────────────────────────────
 # TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
@@ -2187,15 +2604,14 @@ with tab_equipo:
                 )
 
     st.divider()
-    st.markdown("#### 👥 Actividades del equipo por línea y mes (últimos 12 meses)")
-    st.caption("Fuente: `crm.activity.report` (el reporte estándar de Odoo detrás de "
-              "'CRM > Informes > Actividades'), que sí conserva el histórico completo — a "
-              "diferencia de `mail.activity`, que se borra al marcar la actividad como hecha. "
-              "Solo Implementación Odoo y Soporte y Mantenimiento (Licenciamiento no tiene "
-              "este seguimiento de actividad comercial). No depende del rango del sidebar: "
-              "siempre son los últimos 12 meses.")
+    st.markdown("#### 👥 Actividades del equipo — tabla mes a mes (últimos 12 meses)")
+    st.caption("Fuente: `crm.activity.report` (CRM → Informes → Actividades), agrupado por "
+              "`mail_activity_type_id`. Solo etiquetas **Soporte** e **Implementación Odoo**. "
+              "Ventana fija de 12 meses (no el sidebar). Mide presentación de negocio, "
+              "propuesta, socialización/sustentación y seguimiento.")
 
     desde_12m_gc = (pd.Period(hoy, freq="M") - 11).to_timestamp().date()
+    meses_12 = meses_ultimos_n(hoy, 12)
     actividades_crm, err_act_crm = load_crm_activity_report(
         desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
     if err_act_crm:
@@ -2204,9 +2620,38 @@ with tab_equipo:
         st.info("No hay actividades de Implementación Odoo o Soporte y Mantenimiento en "
                 "crm.activity.report para los últimos 12 meses.")
     else:
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Actividades registradas", len(actividades_crm))
-        c2.metric("Tipos distintos", actividades_crm["tipo"].nunique())
+        c2.metric("De los 4 tipos del brief",
+                  int((actividades_crm["tipo_brief"].isin(TIPOS_ACTIVIDAD)).sum()))
+        otras_n = int((actividades_crm["tipo_brief"] == "Otras").sum())
+        c3.metric("Otras (no mapeadas)", otras_n)
+        if otras_n:
+            nombres_otras = sorted(
+                actividades_crm.loc[actividades_crm["tipo_brief"] == "Otras", "tipo"].unique())
+            st.caption("Tipos de Odoo no mapeados a los 4 del brief: " + ", ".join(nombres_otras))
+
+        col_cfg_act = {
+            "mes": "Mes",
+            "linea": "Línea",
+            "vendedor": "Vendedor",
+            "Total": st.column_config.NumberColumn("Total", format="%d"),
+        }
+        for tipo in TIPOS_ACTIVIDAD:
+            col_cfg_act[tipo] = st.column_config.NumberColumn(tipo, format="%d")
+
+        st.markdown("##### Por línea (Soporte e Implementación Odoo)")
+        tabla_linea = tabla_actividades_mes_a_mes(
+            actividades_crm, "linea", meses_12, extras=LINEAS_ACTIVIDAD)
+        st.dataframe(tabla_linea, use_container_width=True, hide_index=True,
+                     column_config=col_cfg_act)
+
+        st.markdown("##### Por vendedor")
+        act_unicas = (actividades_crm.drop_duplicates("id")
+                      if "id" in actividades_crm.columns else actividades_crm)
+        tabla_vend = tabla_actividades_mes_a_mes(act_unicas, "vendedor", meses_12)
+        st.dataframe(tabla_vend, use_container_width=True, hide_index=True,
+                     column_config=col_cfg_act)
 
         col_a1, col_a2 = st.columns(2)
         with col_a1:
@@ -2217,20 +2662,63 @@ with tab_equipo:
                          labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
             st.plotly_chart(fig, use_container_width=True)
         with col_a2:
-            por_tipo_vend = (actividades_crm.groupby(["tipo", "vendedor"], as_index=False)
-                             .agg(cantidad=("mes", "count")))
-            fig = px.bar(por_tipo_vend, x="tipo", y="cantidad", color="vendedor",
-                         barmode="group", title="Actividades por tipo y vendedor",
-                         labels={"cantidad": "Actividades", "tipo": "Tipo"})
-            st.plotly_chart(fig, use_container_width=True)
+            act_brief_g = actividades_crm[actividades_crm["tipo_brief"].isin(TIPOS_ACTIVIDAD)]
+            if not act_brief_g.empty:
+                por_tipo_vend = (act_brief_g.groupby(["tipo_brief", "vendedor"], as_index=False)
+                                 .agg(cantidad=("mes", "count")))
+                fig = px.bar(por_tipo_vend, x="tipo_brief", y="cantidad", color="vendedor",
+                             barmode="group", title="Actividades por tipo y vendedor",
+                             labels={"cantidad": "Actividades", "tipo_brief": "Tipo"})
+                st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("📋 Detalle de actividades"):
             st.dataframe(
-                actividades_crm[["date", "linea", "tipo", "vendedor", "equipo"]]
+                actividades_crm[["date", "linea", "tipo", "tipo_brief", "vendedor", "equipo"]]
                     .sort_values("date", ascending=False),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "date": "Fecha", "linea": "Línea", "tipo": "Tipo",
-                    "vendedor": "Vendedor", "equipo": "Equipo",
+                    "date": "Fecha", "linea": "Línea", "tipo": "Tipo Odoo",
+                    "tipo_brief": "Tipo brief", "vendedor": "Vendedor", "equipo": "Equipo",
                 },
             )
+
+    st.markdown("##### Horas comerciales mes a mes (GC3 / GC5 / GC6 / GC8)")
+    st.caption("GC3 presentación de negocio, GC5 cotización/propuesta, GC6 sustentación, "
+               "GC8 seguimiento. Mismas 12 meses. El parte de horas no trae etiqueta CRM.")
+    horas_gc14, err_horas_gc = load_actividades_gc14(
+        desde_12m_gc.isoformat(), hoy.isoformat(), team_ids)
+    if err_horas_gc:
+        st.warning(err_horas_gc)
+    elif horas_gc14.empty:
+        st.info(f"No hay partes de horas en {PROYECTO_PARTE_HORAS_TD} para los últimos 12 meses.")
+    else:
+        horas_gc = horas_gc14.copy()
+        horas_gc["mes"] = pd.to_datetime(horas_gc["date"]).dt.to_period("M").astype(str)
+        horas_mapeadas = horas_gc[horas_gc["tipo_brief"].isin(TIPOS_ACTIVIDAD)]
+        if horas_mapeadas.empty:
+            tareas = sorted(horas_gc["tarea"].dropna().unique().tolist())
+            st.info("No se encontraron tareas GC3/GC5/GC6/GC8. Tareas vistas: "
+                    + (", ".join(tareas) if tareas else "ninguna") + ".")
+        else:
+            horas_sum = (horas_mapeadas.groupby(["mes", "tipo_brief"], as_index=False)
+                         ["unit_amount"].sum())
+            tabla_h = horas_sum.pivot_table(
+                index="mes", columns="tipo_brief", values="unit_amount",
+                aggfunc="sum", fill_value=0)
+            for tipo in TIPOS_ACTIVIDAD:
+                if tipo not in tabla_h.columns:
+                    tabla_h[tipo] = 0.0
+            tabla_h = tabla_h.reindex(meses_12, fill_value=0)
+            tabla_h = tabla_h[TIPOS_ACTIVIDAD]
+            tabla_h["Total"] = tabla_h[TIPOS_ACTIVIDAD].sum(axis=1)
+            tabla_h = tabla_h.reset_index().rename(columns={"index": "mes"})
+            col_cfg_h = {"mes": "Mes"}
+            for tipo in TIPOS_ACTIVIDAD + ["Total"]:
+                col_cfg_h[tipo] = st.column_config.NumberColumn(tipo, format="%.1f")
+            st.dataframe(tabla_h, use_container_width=True, hide_index=True,
+                         column_config=col_cfg_h)
+
+            fig = px.bar(horas_sum, x="mes", y="unit_amount", color="tipo_brief",
+                         barmode="group", title="Horas por tipo GC y mes",
+                         labels={"unit_amount": "Horas", "mes": "Mes", "tipo_brief": "Tipo"})
+            st.plotly_chart(fig, use_container_width=True)
