@@ -2109,7 +2109,7 @@ with tab_lineas:
             st.plotly_chart(fig, use_container_width=True, key="chart_31")
 
         st.markdown("#### Ganado por mes y vendedor, por línea")
-        for linea_nombre in con_meta_l["linea"]:
+        for linea_nombre in con_meta_l["linea"].drop_duplicates():
             datos_linea = won_lineas[won_lineas["linea"] == linea_nombre]
             if datos_linea.empty:
                 continue
@@ -2118,7 +2118,10 @@ with tab_lineas:
             fig = px.bar(mensual_linea_vendedor, x="mes", y="expected_revenue", color="vendedor",
                          barmode="group", title=f"{linea_nombre} — ganado por mes y vendedor",
                          labels={"expected_revenue": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True, key="chart_32")
+            st.plotly_chart(
+                fig, use_container_width=True,
+                key=f"chart_linea_vendedor_{linea_nombre}",
+            )
 
         st.markdown("#### 🆕 Ganado por línea: cliente Nuevo vs. Recurrente")
         st.caption("Según la etiqueta de Odoo: la variación 'Nuevo' de la etiqueta de línea "
