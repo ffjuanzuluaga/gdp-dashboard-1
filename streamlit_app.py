@@ -1220,7 +1220,7 @@ with tab_td:
                              title="Proyectos vendidos por mes",
                              labels={"proyectos": "Proyectos", "mes": "Mes"})
                 fig.update_traces(textposition="outside")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_1")
         with col_b:
             soporte_12m = won_12m[won_12m["linea"] == "Soporte y Mantenimiento"] if not won_12m.empty else won_12m
             if soporte_12m.empty:
@@ -1235,14 +1235,14 @@ with tab_td:
                              title="Contratos de soporte vendidos por mes",
                              labels={"contratos": "Contratos", "mes": "Mes"})
                 fig.update_traces(textposition="outside")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_2")
 
         st.divider()
         st.markdown("#### 🧾 Facturación mensual por tipo (Proyectos / Soporte / Licenciamiento)")
         fig = px.bar(datos_td, x="mes", y="facturado", color="linea", barmode="group",
                      title=f"Facturado por mes y línea — {anio_td}",
                      labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_3")
 
         st.markdown("#### 🏆 Meta del año y total facturado por tipo")
         resumen_tipo = metas_lineas_td.merge(
@@ -1289,7 +1289,7 @@ with tab_td:
                 fig = px.bar(top_v_fact.sort_values("monto"), x="monto", y="vendedor",
                              orientation="h", title=f"Top 10 vendedores por facturado — {anio_td}",
                              text_auto=".2s", labels={"monto": "COP sin IVA", "vendedor": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_4")
                 st.dataframe(
                     top_v_fact, use_container_width=True, hide_index=True,
                     column_config={
@@ -1307,7 +1307,7 @@ with tab_td:
                 fig = px.bar(top_v_crm.sort_values("ganados"), x="ganados", y="vendedor",
                              orientation="h", title=f"Top 10 vendedores por CRM ganados — {anio_td}",
                              text_auto=True, labels={"ganados": "Oportunidades", "vendedor": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_5")
                 st.dataframe(
                     top_v_crm, use_container_width=True, hide_index=True,
                     column_config={
@@ -1327,7 +1327,7 @@ with tab_td:
                 fig = px.bar(top_c_fact.sort_values("monto"), x="monto", y="cliente",
                              orientation="h", title=f"Top 10 clientes por facturado — {anio_td}",
                              text_auto=".2s", labels={"monto": "COP sin IVA", "cliente": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_6")
                 st.dataframe(
                     top_c_fact, use_container_width=True, hide_index=True,
                     column_config={
@@ -1345,7 +1345,7 @@ with tab_td:
                 fig = px.bar(top_c_crm.sort_values("ganados"), x="ganados", y="cliente",
                              orientation="h", title=f"Top 10 clientes por CRM ganados — {anio_td}",
                              text_auto=True, labels={"ganados": "Oportunidades", "cliente": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_7")
                 st.dataframe(
                     top_c_crm, use_container_width=True, hide_index=True,
                     column_config={
@@ -1375,14 +1375,14 @@ with tab_ventas:
             fig = px.bar(por_equipo, x="equipo", y="amount_total",
                          title="Ventas por equipo", text_auto=".2s",
                          labels={"amount_total": "Total", "equipo": "Equipo"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_8")
         with col_b:
             mensual = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
                        .groupby(["mes", "equipo"], as_index=False)["amount_total"].sum())
             fig = px.line(mensual, x="mes", y="amount_total", color="equipo",
                           markers=True, title="Evolución mensual por equipo",
                           labels={"amount_total": "Total", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_9")
 
         col_c, col_d = st.columns(2)
         with col_c:
@@ -1391,21 +1391,21 @@ with tab_ventas:
             fig = px.bar(por_vendedor, x="amount_total", y="vendedor", orientation="h",
                          title="Top 10 vendedores", text_auto=".2s",
                          labels={"amount_total": "Total", "vendedor": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_10")
         with col_d:
             top_clientes = (sales.groupby("cliente", as_index=False)["amount_total"]
                             .sum().sort_values("amount_total", ascending=True).tail(10))
             fig = px.bar(top_clientes, x="amount_total", y="cliente", orientation="h",
                          title="Top 10 clientes", text_auto=".2s",
                          labels={"amount_total": "Total", "cliente": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_11")
 
         mensual_vendedor = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
                             .groupby(["mes", "vendedor"], as_index=False)["amount_total"].sum())
         fig = px.bar(mensual_vendedor, x="mes", y="amount_total", color="vendedor",
                      barmode="group", title="Ventas por vendedor y mes",
                      labels={"amount_total": "Total", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_12")
 
         with st.expander("📋 Detalle de órdenes"):
             st.dataframe(
@@ -1431,7 +1431,7 @@ with tab_ventas:
             fig = px.bar(mensual_vendedor_12m, x="mes", y="amount_total", color="vendedor",
                          barmode="group", title="Ventas por vendedor y mes — últimos 12 meses",
                          labels={"amount_total": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_13")
     with col_v12b:
         if won_12m_v.empty:
             st.info("No hay oportunidades cerradas (ganadas) en los últimos 12 meses.")
@@ -1442,7 +1442,7 @@ with tab_ventas:
                          barmode="group",
                          title="Oportunidades cerradas (ganadas) por vendedor y mes — últimos 12 meses",
                          labels={"oportunidades": "Oportunidades", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_14")
 
 # ─────────────────────────────────────────────
 # TAB 2: Facturación (account.move + Aged Receivable)
@@ -1480,14 +1480,14 @@ with tab_fact:
             fig = px.bar(por_equipo, x="equipo", y="amount_untaxed_signed",
                          title="Facturación neta por equipo (sin IVA)", text_auto=".2s",
                          labels={"amount_untaxed_signed": "COP", "equipo": "Equipo"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_15")
         with col_b:
             mensual = (invoices.assign(mes=invoices["invoice_date"].dt.to_period("M").astype(str))
                        .groupby(["mes", "equipo"], as_index=False)["amount_untaxed_signed"].sum())
             fig = px.bar(mensual, x="mes", y="amount_untaxed_signed", color="equipo",
                          barmode="group", title="Facturación mensual por equipo (sin IVA)",
                          labels={"amount_untaxed_signed": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_16")
 
         with st.expander("📋 Detalle de facturas del período"):
             st.dataframe(
@@ -1563,7 +1563,7 @@ with tab_fact:
         fig = px.bar(cubos_sum, x="cubo", y="saldo", text_auto=".2s",
                      title="Cartera por antigüedad (Aged Receivable)",
                      labels={"cubo": "Cubo", "saldo": "COP"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_17")
 
     st.divider()
     st.markdown("### 🎯 Cumplimiento Meta vs. Vendido vs. Facturado por línea de negocio")
@@ -1628,12 +1628,12 @@ with tab_fact:
                      color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#f5a623",
                                          "Facturado": "#1f77b4"},
                      labels={"valor": "COP", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_18")
 
         fig = px.bar(datos_cumpl, x="mes", y="facturado", color="linea", barmode="group",
                      title="Facturado por mes y línea de negocio",
                      labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_19")
 
         col_config_pivote = {"Línea": "Línea"}
         for m in MESES_ES:
@@ -1715,7 +1715,7 @@ with tab_crm:
                            valor=("expected_revenue", "sum")))
             fig = px.funnel(embudo, x="valor", y="etapa",
                             title="Embudo de pipeline abierto (valor esperado)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_20")
         with col_b:
             por_equipo = (leads.groupby(["equipo", "estado"], as_index=False)
                           .agg(n=("name", "count")))
@@ -1724,7 +1724,7 @@ with tab_crm:
                          color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
                                              "Abierta": "#1f77b4"},
                          labels={"n": "Oportunidades", "equipo": "Equipo"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_21")
 
         por_vendedor = (leads.groupby(["vendedor", "estado"], as_index=False)
                         .agg(valor=("expected_revenue", "sum")))
@@ -1733,7 +1733,7 @@ with tab_crm:
                      color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
                                          "Abierta": "#1f77b4"},
                      labels={"valor": "Valor esperado", "vendedor": ""})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_22")
 
         with st.expander("📋 Detalle de oportunidades"):
             st.dataframe(
@@ -1795,21 +1795,21 @@ with tab_leads:
             fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
                          barmode="stack", title="Leads mensuales por vendedor (apilado)",
                          labels={"leads": "Leads", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_23")
 
             mensual_origen = (leads_full.groupby(["mes", "origen"], as_index=False)
                               .agg(leads=("name", "count")))
             fig = px.bar(mensual_origen, x="mes", y="leads", color="origen",
                          barmode="stack", title="Leads mensuales por origen (incluye archivados)",
                          labels={"leads": "Leads", "mes": "Mes", "origen": "Origen"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_24")
 
             mensual_medio = (leads_full.groupby(["mes", "medio"], as_index=False)
                              .agg(leads=("name", "count")))
             fig = px.bar(mensual_medio, x="mes", y="leads", color="medio",
                          barmode="stack", title="Leads creados por medio y mes",
                          labels={"leads": "Leads", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_25")
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1820,7 +1820,7 @@ with tab_leads:
                 fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
                              title="Leads creados por origen", text_auto=True,
                              labels={"leads": "Leads", "origen": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_26")
         with col_b:
             if not leads_full.empty:
                 fig = px.bar(conv_vendedor.sort_values("tasa_conversion"),
@@ -1828,7 +1828,7 @@ with tab_leads:
                              title="Tasa de conversión por vendedor (ganadas / leads creados)",
                              text_auto=".1f",
                              labels={"tasa_conversion": "% conversión", "vendedor": ""})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_27")
 
         if not closed.empty:
             conv_medio = closed.groupby("medio", as_index=False).agg(
@@ -1949,13 +1949,13 @@ with tab_metas:
                          barmode="group", title="Vendido vs. meta del período",
                          color_discrete_map={"Meta del período": "#9ca3af", "Vendido": "#1f77b4"},
                          labels={"valor": "COP", "vendedor": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_28")
         with col_b:
             mensual = (won.groupby(["mes", "vendedor"], as_index=False)["expected_revenue"].sum())
             fig = px.bar(mensual, x="mes", y="expected_revenue", color="vendedor",
                          title="Ganados por mes y vendedor (reporte de ganados)",
                          labels={"expected_revenue": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_29")
 
         with st.expander("📋 Detalle de oportunidades ganadas"):
             st.dataframe(
@@ -2100,13 +2100,13 @@ with tab_lineas:
                          barmode="group", title="Vendido vs. meta del período por línea",
                          color_discrete_map={"Meta del período": "#9ca3af", "Vendido": "#1f77b4"},
                          labels={"valor": "COP", "linea": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_30")
         with col_b:
             mensual_l = (won_lineas.groupby(["mes", "linea"], as_index=False)["expected_revenue"].sum())
             fig = px.bar(mensual_l, x="mes", y="expected_revenue", color="linea",
                          title="Ganados por mes y línea",
                          labels={"expected_revenue": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_31")
 
         st.markdown("#### Ganado por mes y vendedor, por línea")
         for linea_nombre in con_meta_l["linea"]:
@@ -2118,7 +2118,7 @@ with tab_lineas:
             fig = px.bar(mensual_linea_vendedor, x="mes", y="expected_revenue", color="vendedor",
                          barmode="group", title=f"{linea_nombre} — ganado por mes y vendedor",
                          labels={"expected_revenue": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_32")
 
         st.markdown("#### 🆕 Ganado por línea: cliente Nuevo vs. Recurrente")
         st.caption("Según la etiqueta de Odoo: la variación 'Nuevo' de la etiqueta de línea "
@@ -2138,7 +2138,7 @@ with tab_lineas:
                          barmode="stack", title="Ganado por línea: Nuevo vs. Recurrente",
                          color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"},
                          labels={"expected_revenue": "COP", "linea": "Línea", "segmento": "Segmento"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_33")
 
             resumen_nuevo = (nuevo_vs_rec.pivot(index="linea", columns="segmento",
                                                  values="expected_revenue").fillna(0))
@@ -2215,14 +2215,14 @@ with tab_clientes:
                             title="Clientes: nuevos vs. recurrentes", hole=0.45,
                             color="segmento",
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_34")
             with col_b:
                 fact_seg = resumen.groupby("segmento", as_index=False)["amount_untaxed_signed"].sum()
                 fig = px.pie(fact_seg, names="segmento", values="amount_untaxed_signed",
                             title="Facturación del período: nuevos vs. recurrentes", hole=0.45,
                             color="segmento",
                             color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_35")
 
             st.markdown("#### Comparativo de facturación: nuevos vs. recurrentes")
             orden_segmento = {"Nuevo": 0, "Recurrente": 1}
@@ -2294,7 +2294,7 @@ with tab_clientes:
             fig = px.bar(top_ventas_anio, x="monto", y="cliente", orientation="h",
                          title=f"Top 10 clientes por facturado — {anio_top_clientes}", text_auto=".2s",
                          labels={"monto": "COP sin IVA", "cliente": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_36")
             st.dataframe(
                 top_ventas_anio.sort_values("monto", ascending=False),
                 use_container_width=True, hide_index=True,
@@ -2313,7 +2313,7 @@ with tab_clientes:
             fig = px.bar(top_oport_anio, x="ganados", y="cliente", orientation="h",
                          title=f"Top 10 clientes por CRM ganados — {anio_top_clientes}",
                          text_auto=True, labels={"ganados": "Oportunidades", "cliente": ""})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_37")
             st.dataframe(
                 top_oport_anio.sort_values("ganados", ascending=False),
                 use_container_width=True, hide_index=True,
@@ -2367,7 +2367,7 @@ with tab_soporte:
                          title="Facturación de Soporte por mes: nuevo vs. ya se facturaba",
                          color_discrete_map={"Nuevo": "#1f77b4", "Ya se facturaba antes": "#9ca3af"},
                          labels={"monto": "Facturado", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_38")
 
             st.markdown("#### Comparativo de facturación de Soporte")
             resumen_seg = soporte_periodo.groupby("segmento", as_index=False)["monto"].sum()
@@ -2461,7 +2461,7 @@ with tab_rentabilidad:
         fig = px.bar(rent_tabla, x="linea", y=["facturado", "costo"], barmode="group",
                      title=f"Facturado vs. costo del equipo por línea — {anio_rent}",
                      labels={"value": "COP", "linea": "Línea", "variable": "Concepto"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_39")
 
         if not costos_rent.empty:
             costo_mensual = costos_rent.groupby(["mes", "linea"], as_index=False)["costo"].sum()
@@ -2473,7 +2473,7 @@ with tab_rentabilidad:
             fig = px.bar(rent_mensual, x="mes", y="rentabilidad", color="linea", barmode="group",
                          title="Rentabilidad mensual por línea",
                          labels={"rentabilidad": "COP", "mes": "Mes", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_40")
 
             with st.expander("📋 Detalle mensual de rentabilidad por línea"):
                 st.dataframe(
@@ -2524,14 +2524,14 @@ with tab_equipo:
             fig = px.bar(mensual_horas, x="mes", y="horas_vendidas", text_auto=".1f",
                          title="Horas vendidas por mes",
                          labels={"horas_vendidas": "Horas", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_41")
         with col_h2:
             mensual_horas_vendedor = (horas_df.groupby(["mes", "vendedor"], as_index=False)
                                       ["horas_vendidas"].sum())
             fig = px.bar(mensual_horas_vendedor, x="mes", y="horas_vendidas", color="vendedor",
                          barmode="group", title="Horas vendidas por vendedor y mes",
                          labels={"horas_vendidas": "Horas", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_42")
 
     st.divider()
     st.markdown("#### 📋 Tabla gerencial: actividades comerciales y oportunidades cerradas — TD")
@@ -2660,7 +2660,7 @@ with tab_equipo:
             fig = px.bar(cantidad_linea_mes, x="mes", y="cantidad", color="linea", barmode="group",
                          title="Actividades por línea y mes",
                          labels={"cantidad": "Actividades", "mes": "Mes", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_43")
         with col_a2:
             act_brief_g = actividades_crm[actividades_crm["tipo_brief"].isin(TIPOS_ACTIVIDAD)]
             if not act_brief_g.empty:
@@ -2669,7 +2669,7 @@ with tab_equipo:
                 fig = px.bar(por_tipo_vend, x="tipo_brief", y="cantidad", color="vendedor",
                              barmode="group", title="Actividades por tipo y vendedor",
                              labels={"cantidad": "Actividades", "tipo_brief": "Tipo"})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="chart_44")
 
         with st.expander("📋 Detalle de actividades"):
             st.dataframe(
@@ -2721,4 +2721,4 @@ with tab_equipo:
             fig = px.bar(horas_sum, x="mes", y="unit_amount", color="tipo_brief",
                          barmode="group", title="Horas por tipo GC y mes",
                          labels={"unit_amount": "Horas", "mes": "Mes", "tipo_brief": "Tipo"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_45")
