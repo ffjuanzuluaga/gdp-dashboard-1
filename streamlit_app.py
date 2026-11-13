@@ -82,7 +82,15 @@ def m2o_name(series: pd.Series) -> pd.Series:
 
 
 def m2o_id(series: pd.Series) -> pd.Series:
-    return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
+    return series.apply(_m2o_id_one)
+
+
+def _m2o_id_one(v) -> int | None:
+    if isinstance(v, (list, tuple)) and v:
+        return int(v[0])
+    if isinstance(v, int):
+        return v
+    return None
 
 
 def _normalizar(s: str) -> str:
@@ -315,11 +323,15 @@ def load_product_category_ids() -> dict[str, int]:
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
-def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int]) -> pd.DataFrame:
+def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None = None) -> pd.DataFrame:
     """Historial de líneas de factura de una categoría, en COP de la compañía y
-    SIN impuestos. Fuente: account.invoice.report.price_subtotal (= -line.balance
-    * rate), no account.move.line.price_subtotal (ese va en moneda del documento
-    y deja el licenciamiento en USD)."""
+    SIN impuestos. Misma lógica que Contabilidad → Análisis de Facturas (Odoo 19):
+    `account.invoice.report.price_subtotal` (= -line.balance * rate) y filtro de
+    categoría con `child_of` (como el search view estándar). No se filtra por
+    equipo de ventas: el informe de referencia (p. ej. INFORME SOPORTE) agrupa
+    solo por categoría de producto. `team_ids` se ignora a propósito (firma
+    conservada por callers)."""
+    del team_ids  # la clasificación es por categoría, no por crm.team
     categ_ids = load_product_category_ids()
     categ_id = categ_ids.get(categoria)
     if not categ_id:
@@ -328,10 +340,9 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int]) -> pd.D
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
-        ("product_categ_id", "=", categ_id),
+        # Odoo 19: filter_domain del Análisis de Facturas usa child_of, no "=".
+        ("product_categ_id", "child_of", categ_id),
     ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
     try:
         df = search_read(
             "account.invoice.report", domain,
@@ -344,25 +355,33 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int]) -> pd.D
             ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
             ("move_id.state", "=", "posted"),
             ("display_type", "=", "product"),
-            ("product_id.categ_id", "=", categ_id),
+            ("product_id.categ_id", "child_of", categ_id),
         ]
-        if team_ids:
-            domain_aml.append(("move_id.team_id", "in", team_ids))
         df = search_read(
             "account.move.line", domain_aml,
-            ["date", "partner_id", "balance"],
+            ["date", "partner_id", "balance", "move_id"],
             order="date",
         )
         if df.empty:
             return df
-        df["invoice_date"] = df["date"]
+        # Preferir invoice_date del move (igual que account.invoice.report).
+        move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
+        move_dates = {}
+        if move_ids:
+            moves = search_read("account.move", [("id", "in", move_ids)],
+                                ["id", "invoice_date"])
+            move_dates = {int(r["id"]): r.get("invoice_date") for _, r in moves.iterrows()}
+        df["invoice_date"] = df["move_id"].apply(
+            lambda m: move_dates.get(_m2o_id_one(m)))
+        df["invoice_date"] = df["invoice_date"].fillna(df["date"])
         df["invoice_user_id"] = None
         df["price_subtotal"] = -pd.to_numeric(df["balance"], errors="coerce").fillna(0)
     if df.empty:
         return df
-    df["date"] = pd.to_datetime(df["invoice_date"])
+    # Fecha de factura (Date) → mes calendario, sin zonas horarias.
+    df["date"] = pd.to_datetime(df["invoice_date"], errors="coerce").dt.normalize()
     df["monto"] = pd.to_numeric(df["price_subtotal"], errors="coerce").fillna(0)
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["mes"] = df["date"].dt.strftime("%Y-%m")
     df["cliente_id"] = m2o_id(df["partner_id"])
     df["cliente"] = m2o_name(df["partner_id"])
     df["vendedor"] = m2o_name(df["invoice_user_id"])
@@ -612,19 +631,15 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
 
 @st.cache_data(ttl=600, show_spinner="Cargando cumplimiento mensual por línea...")
 def load_cumplimiento_mensual(year: int, team_ids: list[int]) -> pd.DataFrame:
-    """Vendido (CRM ganado) y Facturado, por línea de negocio y mes, para el año
-    dado. Una fila por (línea, mes) con columnas 'vendido' y 'facturado';
-    incluye los 12 meses aunque no haya movimiento (quedan en 0)."""
-    won = load_won_lineas(f"{year}-01-01", f"{year}-12-31", team_ids)
-    if not won.empty:
-        vendido = (won.groupby(["linea", "mes"], as_index=False)["expected_revenue"]
-                   .sum().rename(columns={"expected_revenue": "vendido"}))
-    else:
-        vendido = pd.DataFrame(columns=["linea", "mes", "vendido"])
-
+    """Ventas / facturado por línea y mes para el año, SIN IVA.
+    Fuente única: account.invoice.report (misma que Análisis de Facturas).
+    'vendido' y 'facturado' son el mismo monto (facturado antes de impuestos);
+    se mantienen ambas columnas por compatibilidad con pivotes/gráficos.
+    `team_ids` no aplica: la clasificación es por categoría de producto."""
+    del team_ids
     partes = []
     for linea, categoria in LINEA_CATEGORIA.items():
-        lineas_fact = load_invoice_lines_by_categoria(categoria, team_ids)
+        lineas_fact = load_invoice_lines_by_categoria(categoria)
         if lineas_fact.empty:
             continue
         lineas_fact = lineas_fact[lineas_fact["date"].dt.year == year]
@@ -640,10 +655,10 @@ def load_cumplimiento_mensual(year: int, team_ids: list[int]) -> pd.DataFrame:
     meses = [f"{year}-{m:02d}" for m in range(1, 13)]
     base = pd.MultiIndex.from_product(
         [list(LINEA_CATEGORIA.keys()), meses], names=["linea", "mes"]).to_frame(index=False)
-    tabla = base.merge(vendido, on=["linea", "mes"], how="left")
-    tabla = tabla.merge(facturado, on=["linea", "mes"], how="left")
-    tabla["vendido"] = tabla["vendido"].fillna(0)
+    tabla = base.merge(facturado, on=["linea", "mes"], how="left")
     tabla["facturado"] = tabla["facturado"].fillna(0)
+    # Ventas del cumplimiento = facturado antes de impuestos (no CRM).
+    tabla["vendido"] = tabla["facturado"]
     return tabla
 
 
@@ -1273,7 +1288,7 @@ with tab_td:
         st.markdown("#### 🎯 Resumen del año")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Meta de ventas año", fmt_money(meta_anual_td))
-        c2.metric("Ventas acumuladas del año", fmt_money(vendido_anual_td))
+        c2.metric("Ventas facturadas del año (sin IVA)", fmt_money(vendido_anual_td))
         c3.metric("Facturación acumulada del año", fmt_money(facturado_anual_td))
         c4.metric("% cumplimiento anual", f"{pct_anual_td:.1f}%")
         c5.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_td:.1f}%",
@@ -1724,10 +1739,11 @@ with tab_fact:
         st.plotly_chart(fig, use_container_width=True, key="chart_17")
 
     st.divider()
-    st.markdown("### 🎯 Cumplimiento Meta vs. Vendido vs. Facturado por línea de negocio")
-    st.caption("Esta sección usa un año calendario completo (no el rango de fechas del "
-              "sidebar), para poder comparar los 12 meses a la vez, igual que el reporte "
-              "de referencia en Excel/Sheets.")
+    st.markdown("### 🎯 Cumplimiento Meta vs. Ventas facturadas por línea de negocio")
+    st.caption("Año calendario completo (no el rango del sidebar). Las **ventas** del "
+              "cumplimiento son lo **facturado antes de impuestos** "
+              "(`account.invoice.report.price_subtotal`, misma fuente que Análisis de "
+              "Facturas en Odoo 19), clasificado por categoría de producto.")
 
     anio_cumpl = st.selectbox("Año a analizar", options=range(hoy.year, hoy.year - 4, -1),
                               index=0, key="anio_cumplimiento_lineas")
@@ -1742,24 +1758,22 @@ with tab_fact:
         datos_cumpl["diferencia"] = datos_cumpl["facturado"] - datos_cumpl["meta_mensual"]
 
         meta_anual_total = metas_lineas_cumpl["meta_anual"].sum()
-        vendido_total = datos_cumpl["vendido"].sum()
         facturado_total = datos_cumpl["facturado"].sum()
         pct_anual_total = (facturado_total / meta_anual_total * 100) if meta_anual_total else 0
         meta_a_la_fecha_total = meta_prorateada_a_hoy(meta_anual_total, anio_cumpl, hoy)
         pct_a_la_fecha_total = (facturado_total / meta_a_la_fecha_total * 100) if meta_a_la_fecha_total else 0
         diferencia_total = facturado_total - meta_anual_total
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Meta anual (3 líneas)", fmt_money(meta_anual_total))
-        c2.metric("Vendido acumulado", fmt_money(vendido_total))
-        c3.metric("Facturado acumulado", fmt_money(facturado_total))
-        c4.metric("% cumplimiento anual", f"{pct_anual_total:.1f}%")
-        c5.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_total:.1f}%",
+        c2.metric("Ventas facturadas (sin IVA)", fmt_money(facturado_total))
+        c3.metric("% cumplimiento anual", f"{pct_anual_total:.1f}%")
+        c4.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_total:.1f}%",
                   help="Compara lo facturado contra la meta prorateada según los días "
                        "transcurridos del año (no contra la meta anual completa): 100% "
                        "significa que vamos exactamente como se esperaba a estas alturas "
                        "del año.")
-        c6.metric("Diferencia vs. meta anual", fmt_money(diferencia_total))
+        c5.metric("Diferencia vs. meta anual", fmt_money(diferencia_total))
 
         with st.expander("📌 Metas anuales y mensuales por línea"):
             ref = metas_lineas_cumpl[metas_lineas_cumpl["linea"].isin(LINEA_CATEGORIA)].copy()
@@ -1774,23 +1788,23 @@ with tab_fact:
                 },
             )
 
-        consolidado_mensual = datos_cumpl.groupby("mes", as_index=False)[["vendido", "facturado"]].sum()
+        consolidado_mensual = datos_cumpl.groupby("mes", as_index=False)["facturado"].sum()
         consolidado_mensual["meta"] = meta_anual_total / 12
         consolidado_largo = consolidado_mensual.melt(
-            id_vars="mes", value_vars=["meta", "vendido", "facturado"],
+            id_vars="mes", value_vars=["meta", "facturado"],
             var_name="concepto", value_name="valor")
         consolidado_largo["concepto"] = consolidado_largo["concepto"].map(
-            {"meta": "Meta mensual", "vendido": "Vendido", "facturado": "Facturado"})
+            {"meta": "Meta mensual", "facturado": "Ventas facturadas (sin IVA)"})
         fig = px.bar(consolidado_largo, x="mes", y="valor", color="concepto", barmode="group",
-                     title="Meta vs. Vendido vs. Facturado por mes (consolidado, 3 líneas)",
-                     color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#f5a623",
-                                         "Facturado": "#1f77b4"},
+                     title="Meta vs. Ventas facturadas por mes (consolidado, 3 líneas)",
+                     color_discrete_map={"Meta mensual": "#9ca3af",
+                                         "Ventas facturadas (sin IVA)": "#1f77b4"},
                      labels={"valor": "COP", "mes": "Mes"})
         show_bar_labels(fig, kind="money")
         st.plotly_chart(fig, use_container_width=True, key="chart_18")
 
         fig = px.bar(datos_cumpl, x="mes", y="facturado", color="linea", barmode="group",
-                     title="Facturado por mes y línea de negocio",
+                     title="Ventas facturadas por mes y línea de negocio (sin IVA)",
                      labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
         show_bar_labels(fig, kind="money")
         st.plotly_chart(fig, use_container_width=True, key="chart_19")
@@ -1804,12 +1818,7 @@ with tab_fact:
         col_config_pivote["% Cumpl. a la Fecha"] = st.column_config.ProgressColumn(
             "% Cumpl. a la Fecha", format="%.1f%%", min_value=0, max_value=150)
 
-        st.markdown("#### 📈 Ventas (CRM ganado) por línea y mes")
-        pivote_ventas = construir_pivote_cumplimiento(datos_cumpl, "vendido", anio_cumpl, metas_lineas_cumpl, hoy)
-        st.dataframe(pivote_ventas, use_container_width=True, hide_index=True,
-                     column_config=col_config_pivote)
-
-        st.markdown("#### 🧾 Facturado por línea y mes")
+        st.markdown("#### 🧾 Ventas facturadas (sin IVA) por línea y mes")
         pivote_facturado = construir_pivote_cumplimiento(datos_cumpl, "facturado", anio_cumpl, metas_lineas_cumpl, hoy)
         st.dataframe(pivote_facturado, use_container_width=True, hide_index=True,
                      column_config=col_config_pivote)
@@ -1827,24 +1836,18 @@ with tab_fact:
 
         with st.expander("📋 Detalle mensual por línea (datos crudos)"):
             detalle = datos_cumpl.copy()
-            detalle["pct_cumpl_venta"] = detalle.apply(
-                lambda r: r["vendido"] / r["meta_mensual"] * 100 if r["meta_mensual"] else 0, axis=1)
-            detalle["pct_cumpl_factura"] = detalle.apply(
+            detalle["pct_cumpl"] = detalle.apply(
                 lambda r: r["facturado"] / r["meta_mensual"] * 100 if r["meta_mensual"] else 0, axis=1)
             st.dataframe(
-                detalle[["linea", "mes", "meta_mensual", "vendido", "facturado",
-                        "pct_cumpl_venta", "pct_cumpl_factura", "diferencia"]]
+                detalle[["linea", "mes", "meta_mensual", "facturado", "pct_cumpl", "diferencia"]]
                     .sort_values(["linea", "mes"]),
                 use_container_width=True, hide_index=True,
                 column_config={
                     "linea": "Línea", "mes": "Mes",
                     "meta_mensual": st.column_config.NumberColumn("Meta mensual", format="$%,.0f"),
-                    "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
-                    "facturado": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
-                    "pct_cumpl_venta": st.column_config.ProgressColumn(
-                        "% Cumpl. Venta", format="%.1f%%", min_value=0, max_value=150),
-                    "pct_cumpl_factura": st.column_config.ProgressColumn(
-                        "% Cumpl. Factura", format="%.1f%%", min_value=0, max_value=150),
+                    "facturado": st.column_config.NumberColumn("Facturado (sin IVA)", format="$%,.0f"),
+                    "pct_cumpl": st.column_config.ProgressColumn(
+                        "% Cumpl.", format="%.1f%%", min_value=0, max_value=150),
                     "diferencia": st.column_config.NumberColumn("Diferencia", format="$%,.0f"),
                 },
             )
@@ -1960,14 +1963,6 @@ with tab_leads:
             add_stack_totals(fig, mensual_vendedor, "mes", "leads", kind="count")
             st.plotly_chart(fig, use_container_width=True, key="chart_23")
 
-            mensual_origen = (leads_full.groupby(["mes", "origen"], as_index=False)
-                              .agg(leads=("name", "count")))
-            fig = px.bar(mensual_origen, x="mes", y="leads", color="origen",
-                         barmode="stack", title="Leads mensuales por origen (incluye archivados)",
-                         labels={"leads": "Leads", "mes": "Mes", "origen": "Origen"})
-            add_stack_totals(fig, mensual_origen, "mes", "leads", kind="count")
-            st.plotly_chart(fig, use_container_width=True, key="chart_24")
-
             mensual_medio = (leads_full.groupby(["mes", "medio"], as_index=False)
                              .agg(leads=("name", "count")))
             fig = px.bar(mensual_medio, x="mes", y="leads", color="medio",
@@ -1979,13 +1974,14 @@ with tab_leads:
         col_a, col_b = st.columns(2)
         with col_a:
             if not leads_full.empty:
-                por_origen = (leads_full.groupby("origen", as_index=False)
-                              .agg(leads=("name", "count"))
-                              .sort_values("leads", ascending=True).tail(10))
-                fig = px.bar(por_origen, x="leads", y="origen", orientation="h",
-                             title="Leads creados por origen", text_auto=True,
-                             labels={"leads": "Leads", "origen": ""})
-                show_bar_labels(fig, kind="count")
+                por_medio_ing = (leads_full.groupby("medio", as_index=False)
+                                 .agg(ingresos=("expected_revenue", "sum"),
+                                      leads=("name", "count"))
+                                 .sort_values("ingresos", ascending=True))
+                fig = px.bar(por_medio_ing, x="ingresos", y="medio", orientation="h",
+                             title="Leads creados por medio (mayor a menor en ingresos)",
+                             labels={"ingresos": "Ingresos esperados", "medio": ""})
+                show_bar_labels(fig, kind="money")
                 st.plotly_chart(fig, use_container_width=True, key="chart_26")
         with col_b:
             if not leads_full.empty:
@@ -2186,22 +2182,40 @@ with tab_metas:
 # TAB: Metas por línea (ganados CRM clasificados por etiqueta vs metas_lineas.csv)
 # ─────────────────────────────────────────────
 with tab_lineas:
+    st.caption("Cumplimiento por línea con **ventas facturadas antes de impuestos** "
+               "(Análisis de Facturas / `account.invoice.report`), no CRM. Las secciones "
+               "de ganados CRM más abajo siguen usando oportunidades.")
     metas_lineas = load_metas_lineas()
     won_lineas = load_won_lineas(d1, d2, team_ids)
-    won_td = load_won(d1, d2, team_ids)
+
+    # Facturado sin IVA por línea en el rango del sidebar (una pasada por categoría).
+    partes_fact_l = []
+    fact_mensual_parts = []
+    for linea, categoria in LINEA_CATEGORIA.items():
+        lf = load_invoice_lines_by_categoria(categoria)
+        if lf.empty:
+            continue
+        mask = (lf["date"].dt.date >= date_from) & (lf["date"].dt.date <= date_to)
+        lf = lf.loc[mask].copy()
+        if lf.empty:
+            continue
+        partes_fact_l.append(pd.DataFrame({"linea": [linea], "vendido": [lf["monto"].sum()]}))
+        res = lf.groupby("mes", as_index=False)["monto"].sum()
+        res["linea"] = linea
+        fact_mensual_parts.append(res)
+    fact_mensual_l = (pd.concat(fact_mensual_parts, ignore_index=True)
+                      if fact_mensual_parts else pd.DataFrame(columns=["mes", "monto", "linea"]))
+    ventas_linea = (pd.concat(partes_fact_l, ignore_index=True)
+                    if partes_fact_l else pd.DataFrame(columns=["linea", "vendido"]))
 
     if metas_lineas.empty:
         st.warning("No se encontró `data/metas_lineas.csv`. Crea el archivo con columnas "
-                   "`linea,meta_anual` en la raíz del repo (el nombre de `linea` debe "
-                   "coincidir EXACTAMENTE con la etiqueta configurada en Odoo CRM).")
-    elif won_lineas.empty:
-        st.info("No hay oportunidades ganadas en el período seleccionado.")
+                   "`linea,meta_anual` (el nombre de `linea` debe coincidir con "
+                   "LINEA_CATEGORIA / etiquetas de negocio).")
+    elif ventas_linea.empty and won_lineas.empty:
+        st.info("No hay facturación ni oportunidades ganadas en el período seleccionado.")
     else:
-        # Meta del período = meta anual prorrateada por los días del rango del sidebar
         dias_periodo_l = (date_to - date_from).days + 1
-
-        ventas_linea = (won_lineas.groupby("linea", as_index=False)["expected_revenue"]
-                        .sum().rename(columns={"expected_revenue": "vendido"}))
 
         cumpl_l = metas_lineas.merge(ventas_linea, on="linea", how="outer")
         cumpl_l["meta_anual"] = cumpl_l["meta_anual"].fillna(0)
@@ -2215,30 +2229,23 @@ with tab_lineas:
 
         sin_meta_l = cumpl_l[(cumpl_l["meta_anual"] == 0) & (cumpl_l["vendido"] > 0)]["linea"].tolist()
         if sin_meta_l:
-            st.warning("⚠️ Líneas con ventas pero SIN meta en metas_lineas.csv (verifica que "
-                       f"el nombre coincida exactamente con la etiqueta en Odoo): {', '.join(sin_meta_l)}")
+            st.warning("⚠️ Líneas con ventas facturadas pero SIN meta en metas_lineas.csv: "
+                       f"{', '.join(sin_meta_l)}")
 
         con_meta_l = cumpl_l[cumpl_l["meta_anual"] > 0]
 
         c1, c2, c3, c4 = st.columns(4)
         total_meta_l = con_meta_l["meta_anual"].sum()
         total_meta_periodo_l = con_meta_l["meta_periodo"].sum()
-        # "Vendido (ganados)" = TODO lo ganado por el equipo en el período, tomado de
-        # `won` (una fila por oportunidad, sin duplicar). No se usa la suma de
-        # won_lineas porque esa explota por etiqueta: una oportunidad con más de una
-        # etiqueta de línea se contaría dos veces. Así coincide con el mismo total en
-        # "Metas por vendedor" en vez de sub-contarlo (excluyendo "Sin etiqueta") o
-        # sobre-contarlo (multi-etiqueta) en silencio.
-        total_vendido_equipo_l = won_td["expected_revenue"].sum()
+        total_vendido_equipo_l = ventas_linea["vendido"].sum() if not ventas_linea.empty else 0.0
         total_vendido_con_meta_l = con_meta_l["vendido"].sum()
         c1.metric("Meta anual (todas las líneas)", fmt_money(total_meta_l))
         c2.metric(f"Meta del período ({dias_periodo_l} días)", fmt_money(total_meta_periodo_l))
-        c3.metric("Vendido (ganados)", fmt_money(total_vendido_equipo_l))
+        c3.metric("Ventas facturadas (sin IVA)", fmt_money(total_vendido_equipo_l))
         c4.metric("Cumplimiento del período",
                   f"{total_vendido_con_meta_l / total_meta_periodo_l * 100:.1f}%" if total_meta_periodo_l else "—",
-                  help="El % de cumplimiento solo compara líneas con meta definida contra "
-                       "su propia meta; 'Vendido (ganados)' de arriba sí incluye todo lo "
-                       "ganado por el equipo, tenga etiqueta de línea o no.")
+                  help="Compara lo facturado sin IVA de cada línea (categoría de producto) "
+                       "contra su meta del período.")
 
         tabla_l = con_meta_l[["linea", "meta_anual", "meta_periodo", "vendido",
                               "pct_periodo", "pct_anual"]].copy()
@@ -2249,7 +2256,7 @@ with tab_lineas:
                 "linea": "Línea",
                 "meta_anual": st.column_config.NumberColumn("Meta anual", format="$%,.0f"),
                 "meta_periodo": st.column_config.NumberColumn("Meta del período", format="$%,.0f"),
-                "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                "vendido": st.column_config.NumberColumn("Facturado (sin IVA)", format="$%,.0f"),
                 "pct_periodo": st.column_config.ProgressColumn(
                     "% del período", format="%.1f%%", min_value=0, max_value=150),
                 "pct_anual": st.column_config.ProgressColumn(
@@ -2264,20 +2271,23 @@ with tab_lineas:
                 value_vars=["meta_periodo", "vendido"],
                 var_name="concepto", value_name="valor")
             comp_l["concepto"] = comp_l["concepto"].map(
-                {"meta_periodo": "Meta del período", "vendido": "Vendido"})
+                {"meta_periodo": "Meta del período", "vendido": "Facturado (sin IVA)"})
             fig = px.bar(comp_l, x="linea", y="valor", color="concepto",
-                         barmode="group", title="Vendido vs. meta del período por línea",
-                         color_discrete_map={"Meta del período": "#9ca3af", "Vendido": "#1f77b4"},
+                         barmode="group", title="Facturado vs. meta del período por línea",
+                         color_discrete_map={"Meta del período": "#9ca3af",
+                                             "Facturado (sin IVA)": "#1f77b4"},
                          labels={"valor": "COP", "linea": ""})
             show_bar_labels(fig, kind="money")
             st.plotly_chart(fig, use_container_width=True, key="chart_30")
         with col_b:
-            mensual_l = (won_lineas.groupby(["mes", "linea"], as_index=False)["expected_revenue"].sum())
-            fig = px.bar(mensual_l, x="mes", y="expected_revenue", color="linea",
-                         title="Ganados por mes y línea",
-                         labels={"expected_revenue": "COP", "mes": "Mes"})
-            show_bar_labels(fig, kind="money", text_size=14)
-            st.plotly_chart(fig, use_container_width=True, key="chart_31")
+            if fact_mensual_l.empty:
+                st.info("No hay facturación por línea en el período.")
+            else:
+                fig = px.bar(fact_mensual_l, x="mes", y="monto", color="linea",
+                             title="Facturado por mes y línea (sin IVA)",
+                             labels={"monto": "COP", "mes": "Mes"})
+                show_bar_labels(fig, kind="money", text_size=14)
+                st.plotly_chart(fig, use_container_width=True, key="chart_31")
 
         st.markdown("#### Ganado por mes y vendedor, por línea")
         for linea_nombre in con_meta_l["linea"].drop_duplicates():
@@ -2506,7 +2516,10 @@ with tab_clientes:
 # TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
 # ─────────────────────────────────────────────
 with tab_soporte:
-    soporte_lines = load_invoice_lines_by_categoria(LINEA_CATEGORIA["Soporte y Mantenimiento"], team_ids)
+    st.caption("Misma fuente que Contabilidad → Análisis de Facturas (Odoo 19): "
+               "`account.invoice.report.price_subtotal` (sin IVA), categoría **Soporte** "
+               "con `child_of` (incluye subcategorías). No filtra por equipo de ventas.")
+    soporte_lines = load_invoice_lines_by_categoria(LINEA_CATEGORIA["Soporte y Mantenimiento"])
 
     if soporte_lines.empty:
         st.info("No hay facturación de la categoría 'Soporte' en el historial.")
