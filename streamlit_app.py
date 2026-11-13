@@ -1081,8 +1081,12 @@ def _fmt_bar_label(v, kind: str = "count") -> str:
     return f"{num:,.1f}"
 
 
-def show_bar_labels(fig, kind: str = "count"):
-    """Pone el valor al final de cada barra (fuera del trazo) para lectura rápida."""
+def show_bar_labels(fig, kind: str = "count", text_size: int | None = None):
+    """Pone el valor al final de cada barra (fuera del trazo) para lectura rápida.
+
+    text_size deja todas las etiquetas al mismo tamaño. Sin eso, Plotly reduce la
+    fuente para que el texto quepa en el segmento y las barras bajas se ven diminutas.
+    """
     max_pos, max_neg = 0.0, 0.0
     has_h = False
     for tr in fig.data:
@@ -1093,6 +1097,12 @@ def show_bar_labels(fig, kind: str = "count"):
         tr.text = [_fmt_bar_label(v, kind) for v in vals]
         tr.textposition = "outside"
         tr.cliponaxis = False
+        if text_size:
+            # "none" evita el scale() que achica el texto; 0 evita que Plotly
+            # rote las etiquetas que no caben a lo ancho de la barra.
+            tr.constraintext = "none"
+            tr.textangle = 0
+            tr.textfont = dict(size=text_size)
         for v in vals:
             if v is None or (isinstance(v, float) and pd.isna(v)):
                 continue
@@ -2266,7 +2276,7 @@ with tab_lineas:
             fig = px.bar(mensual_l, x="mes", y="expected_revenue", color="linea",
                          title="Ganados por mes y línea",
                          labels={"expected_revenue": "COP", "mes": "Mes"})
-            show_bar_labels(fig, kind="money")
+            show_bar_labels(fig, kind="money", text_size=14)
             st.plotly_chart(fig, use_container_width=True, key="chart_31")
 
         st.markdown("#### Ganado por mes y vendedor, por línea")
