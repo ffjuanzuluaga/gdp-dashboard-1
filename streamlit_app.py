@@ -232,6 +232,17 @@ TIPOS_ACTIVIDAD = [
     "Seguimiento",
 ]
 LINEAS_ACTIVIDAD = ["Implementación Odoo", "Soporte y Mantenimiento"]
+# Iniciativas / oportunidades de CRM que no deben entrar en ningún KPI del dashboard.
+CRM_LEAD_IDS_EXCLUIDOS = [1475]
+
+
+def _excluir_crm_leads(domain: list) -> list:
+    """Agrega al dominio el filtro de ids de crm.lead excluidos."""
+    if CRM_LEAD_IDS_EXCLUIDOS:
+        domain = list(domain) + [("id", "not in", CRM_LEAD_IDS_EXCLUIDOS)]
+    return domain
+
+
 CODIGOS_HORAS_GC = {
     "GC3": "Presentación de negocio",
     "GC5": "Propuesta",
@@ -482,6 +493,7 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    domain = _excluir_crm_leads(domain)
     df = search_read(
         "crm.lead",
         domain,
@@ -543,6 +555,7 @@ def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    domain = _excluir_crm_leads(domain)
     df = search_read(
         "crm.lead",
         domain,
@@ -574,6 +587,7 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    domain = _excluir_crm_leads(domain)
     cols = ["name", "date_closed", "vendedor", "equipo", "expected_revenue", "mes",
             "linea", "es_nuevo", "segmento"]
     df = search_read(
@@ -705,6 +719,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    domain = _excluir_crm_leads(domain)
     df = search_read(
         "crm.lead", domain,
         ["name", "create_date", "user_id", "team_id", "medium_id", "source_id",
@@ -741,6 +756,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    domain = _excluir_crm_leads(domain)
     df = search_read(
         "crm.lead", domain,
         ["name", "date_closed", "user_id", "team_id", "medium_id",
@@ -852,6 +868,8 @@ def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     ]
     if team_ids:
         domain.append(("team_id", "in", team_ids))
+    if CRM_LEAD_IDS_EXCLUIDOS:
+        domain.append(("lead_id", "not in", CRM_LEAD_IDS_EXCLUIDOS))
     try:
         df = search_read("crm.activity.report", domain, cols, order="date")
     except Exception as e:
