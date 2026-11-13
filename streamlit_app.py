@@ -136,7 +136,7 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
         "sale.order",
         domain,
         ["name", "date_order", "partner_id", "user_id", "team_id",
-         "amount_untaxed", "amount_total", "state"],
+         "amount_untaxed", "state"],
         order="date_order",
     )
     if df.empty:
@@ -1403,59 +1403,64 @@ with tab_td:
 # TAB 1: Ventas (sale.order)
 # ─────────────────────────────────────────────
 with tab_ventas:
+    st.caption("Montos de órdenes de venta **antes de impuestos** "
+               "(`sale.order.amount_untaxed`).")
     if sales.empty:
         st.info("No hay órdenes de venta confirmadas en el período seleccionado.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Órdenes confirmadas", len(sales))
-        c2.metric("Ventas (sin imp.)", fmt_money(sales["amount_untaxed"].sum()))
-        c3.metric("Ventas (total)", fmt_money(sales["amount_total"].sum()))
-        c4.metric("Ticket promedio", fmt_money(sales["amount_total"].mean()))
+        c2.metric("Ventas (sin IVA)", fmt_money(sales["amount_untaxed"].sum()))
+        c3.metric("Ticket promedio (sin IVA)", fmt_money(sales["amount_untaxed"].mean()))
 
         col_a, col_b = st.columns(2)
         with col_a:
-            por_equipo = (sales.groupby("equipo", as_index=False)["amount_total"]
-                          .sum().sort_values("amount_total", ascending=False))
-            fig = px.bar(por_equipo, x="equipo", y="amount_total",
-                         title="Ventas por equipo", text_auto=".2s",
-                         labels={"amount_total": "Total", "equipo": "Equipo"})
+            por_equipo = (sales.groupby("equipo", as_index=False)["amount_untaxed"]
+                          .sum().sort_values("amount_untaxed", ascending=False))
+            fig = px.bar(por_equipo, x="equipo", y="amount_untaxed",
+                         title="Ventas por equipo (sin IVA)", text_auto=".2s",
+                         labels={"amount_untaxed": "COP sin IVA", "equipo": "Equipo"})
             st.plotly_chart(fig, use_container_width=True, key="chart_8")
         with col_b:
             mensual = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
-                       .groupby(["mes", "equipo"], as_index=False)["amount_total"].sum())
-            fig = px.line(mensual, x="mes", y="amount_total", color="equipo",
-                          markers=True, title="Evolución mensual por equipo",
-                          labels={"amount_total": "Total", "mes": "Mes"})
+                       .groupby(["mes", "equipo"], as_index=False)["amount_untaxed"].sum())
+            fig = px.line(mensual, x="mes", y="amount_untaxed", color="equipo",
+                          markers=True, title="Evolución mensual por equipo (sin IVA)",
+                          labels={"amount_untaxed": "COP sin IVA", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True, key="chart_9")
 
         col_c, col_d = st.columns(2)
         with col_c:
-            por_vendedor = (sales.groupby("vendedor", as_index=False)["amount_total"]
-                            .sum().sort_values("amount_total", ascending=True).tail(10))
-            fig = px.bar(por_vendedor, x="amount_total", y="vendedor", orientation="h",
-                         title="Top 10 vendedores", text_auto=".2s",
-                         labels={"amount_total": "Total", "vendedor": ""})
+            por_vendedor = (sales.groupby("vendedor", as_index=False)["amount_untaxed"]
+                            .sum().sort_values("amount_untaxed", ascending=True).tail(10))
+            fig = px.bar(por_vendedor, x="amount_untaxed", y="vendedor", orientation="h",
+                         title="Top 10 vendedores (sin IVA)", text_auto=".2s",
+                         labels={"amount_untaxed": "COP sin IVA", "vendedor": ""})
             st.plotly_chart(fig, use_container_width=True, key="chart_10")
         with col_d:
-            top_clientes = (sales.groupby("cliente", as_index=False)["amount_total"]
-                            .sum().sort_values("amount_total", ascending=True).tail(10))
-            fig = px.bar(top_clientes, x="amount_total", y="cliente", orientation="h",
-                         title="Top 10 clientes", text_auto=".2s",
-                         labels={"amount_total": "Total", "cliente": ""})
+            top_clientes = (sales.groupby("cliente", as_index=False)["amount_untaxed"]
+                            .sum().sort_values("amount_untaxed", ascending=True).tail(10))
+            fig = px.bar(top_clientes, x="amount_untaxed", y="cliente", orientation="h",
+                         title="Top 10 clientes (sin IVA)", text_auto=".2s",
+                         labels={"amount_untaxed": "COP sin IVA", "cliente": ""})
             st.plotly_chart(fig, use_container_width=True, key="chart_11")
 
         mensual_vendedor = (sales.assign(mes=sales["date_order"].dt.to_period("M").astype(str))
-                            .groupby(["mes", "vendedor"], as_index=False)["amount_total"].sum())
-        fig = px.bar(mensual_vendedor, x="mes", y="amount_total", color="vendedor",
-                     barmode="group", title="Ventas por vendedor y mes",
-                     labels={"amount_total": "Total", "mes": "Mes"})
+                            .groupby(["mes", "vendedor"], as_index=False)["amount_untaxed"].sum())
+        fig = px.bar(mensual_vendedor, x="mes", y="amount_untaxed", color="vendedor",
+                     barmode="group", title="Ventas por vendedor y mes (sin IVA)",
+                     labels={"amount_untaxed": "COP sin IVA", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True, key="chart_12")
 
         with st.expander("📋 Detalle de órdenes"):
             st.dataframe(
                 sales[["name", "date_order", "cliente", "vendedor", "equipo",
-                       "amount_untaxed", "amount_total"]],
+                       "amount_untaxed"]],
                 use_container_width=True, hide_index=True,
+                column_config={
+                    "amount_untaxed": st.column_config.NumberColumn(
+                        "Monto (sin IVA)", format="$%,.0f"),
+                },
             )
 
     st.divider()
@@ -1471,10 +1476,11 @@ with tab_ventas:
         else:
             mensual_vendedor_12m = (sales_12m.assign(
                 mes=sales_12m["date_order"].dt.to_period("M").astype(str))
-                .groupby(["mes", "vendedor"], as_index=False)["amount_total"].sum())
-            fig = px.bar(mensual_vendedor_12m, x="mes", y="amount_total", color="vendedor",
-                         barmode="group", title="Ventas por vendedor y mes — últimos 12 meses",
-                         labels={"amount_total": "COP", "mes": "Mes"})
+                .groupby(["mes", "vendedor"], as_index=False)["amount_untaxed"].sum())
+            fig = px.bar(mensual_vendedor_12m, x="mes", y="amount_untaxed", color="vendedor",
+                         barmode="group",
+                         title="Ventas por vendedor y mes — últimos 12 meses (sin IVA)",
+                         labels={"amount_untaxed": "COP sin IVA", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True, key="chart_13")
     with col_v12b:
         if won_12m_v.empty:
@@ -1546,7 +1552,7 @@ with tab_fact:
                     "amount_untaxed_signed": st.column_config.NumberColumn(
                         "Facturado (sin IVA)", format="$%,.0f"),
                     "amount_residual_signed": st.column_config.NumberColumn(
-                        "Saldo", format="$%,.0f"),
+                        "Saldo por cobrar (con IVA)", format="$%,.0f"),
                     "payment_state": "Estado de pago",
                 },
             )
@@ -1554,7 +1560,9 @@ with tab_fact:
     st.markdown("#### 📂 Cartera vigente — Aged Receivable")
     st.caption("Saldos abiertos a hoy (no el rango del sidebar). Al día = por "
                "pagar en tiempo (vencimiento ≥ hoy). 1-30 … +120 = vencido por "
-               "antigüedad. Las facturas ya pagadas no aparecen.")
+               "antigüedad. Las facturas ya pagadas no aparecen. "
+               "El saldo de cartera es lo que el cliente debe e **incluye IVA** "
+               "(no comparable 1:1 con facturado sin impuestos).")
     cartera, err_cartera = load_aged_receivable(team_ids, hoy.isoformat())
     if err_cartera:
         st.warning(err_cartera)
