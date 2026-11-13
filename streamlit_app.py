@@ -1066,6 +1066,36 @@ def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
 
+def add_stack_totals(fig, df: pd.DataFrame, x: str, y: str, kind: str = "count"):
+    """Anota el total encima de cada barra apilada (suma de segmentos por categoría x)."""
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
+        return fig
+    totales = df.groupby(x, sort=False)[y].sum()
+    if totales.empty:
+        return fig
+    for cat, total in totales.items():
+        if kind == "money":
+            text = fmt_money(float(total))
+        elif kind == "hours":
+            text = f"{float(total):,.1f}"
+        else:
+            text = f"{int(round(float(total)))}"
+        fig.add_annotation(
+            x=cat,
+            y=float(total),
+            text=text,
+            showarrow=False,
+            yshift=14,
+            font=dict(size=11, color="#374151"),
+            bgcolor="rgba(255,255,255,0.75)",
+            borderpad=2,
+        )
+    ymax = float(totales.max())
+    if ymax > 0:
+        fig.update_layout(yaxis=dict(range=[0, ymax * 1.15]))
+    return fig
+
+
 def fmt_miles_apostrofe(v: float) -> str:
     """Valor en miles de pesos, con apóstrofe como separador (p. ej. 40'463 para
     $40.463.000), al estilo de notación informal colombiana."""
@@ -1865,6 +1895,7 @@ with tab_leads:
             fig = px.bar(mensual_vendedor, x="mes", y="leads", color="vendedor",
                          barmode="stack", title="Leads mensuales por vendedor (apilado)",
                          labels={"leads": "Leads", "mes": "Mes"})
+            add_stack_totals(fig, mensual_vendedor, "mes", "leads", kind="count")
             st.plotly_chart(fig, use_container_width=True, key="chart_23")
 
             mensual_origen = (leads_full.groupby(["mes", "origen"], as_index=False)
@@ -1872,6 +1903,7 @@ with tab_leads:
             fig = px.bar(mensual_origen, x="mes", y="leads", color="origen",
                          barmode="stack", title="Leads mensuales por origen (incluye archivados)",
                          labels={"leads": "Leads", "mes": "Mes", "origen": "Origen"})
+            add_stack_totals(fig, mensual_origen, "mes", "leads", kind="count")
             st.plotly_chart(fig, use_container_width=True, key="chart_24")
 
             mensual_medio = (leads_full.groupby(["mes", "medio"], as_index=False)
@@ -1879,6 +1911,7 @@ with tab_leads:
             fig = px.bar(mensual_medio, x="mes", y="leads", color="medio",
                          barmode="stack", title="Leads creados por medio y mes",
                          labels={"leads": "Leads", "mes": "Mes"})
+            add_stack_totals(fig, mensual_medio, "mes", "leads", kind="count")
             st.plotly_chart(fig, use_container_width=True, key="chart_25")
 
         col_a, col_b = st.columns(2)
@@ -2211,6 +2244,7 @@ with tab_lineas:
                          barmode="stack", title="Ganado por línea: Nuevo vs. Recurrente",
                          color_discrete_map={"Nuevo": "#1f77b4", "Recurrente": "#9ca3af"},
                          labels={"expected_revenue": "COP", "linea": "Línea", "segmento": "Segmento"})
+            add_stack_totals(fig, nuevo_vs_rec, "linea", "expected_revenue", kind="money")
             st.plotly_chart(fig, use_container_width=True, key="chart_33")
 
             resumen_nuevo = (nuevo_vs_rec.pivot(index="linea", columns="segmento",
@@ -2440,6 +2474,7 @@ with tab_soporte:
                          title="Facturación de Soporte por mes: nuevo vs. ya se facturaba",
                          color_discrete_map={"Nuevo": "#1f77b4", "Ya se facturaba antes": "#9ca3af"},
                          labels={"monto": "Facturado", "mes": "Mes"})
+            add_stack_totals(fig, mensual_seg, "mes", "monto", kind="money")
             st.plotly_chart(fig, use_container_width=True, key="chart_38")
 
             st.markdown("#### Comparativo de facturación de Soporte")
@@ -2849,6 +2884,7 @@ with tab_equipo:
                 fig = px.bar(horas_mes_vend, x="mes", y="unit_amount", color="vendedor",
                              barmode="stack", title="Horas comerciales por vendedor y mes",
                              labels={"unit_amount": "Horas", "mes": "Mes"})
+                add_stack_totals(fig, horas_mes_vend, "mes", "unit_amount", kind="hours")
                 st.plotly_chart(fig, use_container_width=True, key="chart_horas_vendedor")
 
                 with st.expander("📋 Detalle de partes de horas (para validar línea a línea)"):
