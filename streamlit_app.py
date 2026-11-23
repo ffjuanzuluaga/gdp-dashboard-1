@@ -11,6 +11,7 @@ que account.analytic.line no tiene equipo de ventas (ver LINEA_CUENTA_ANALITICA)
 Pensado para desplegarse en Streamlit Community Cloud (share.streamlit.io).
 """
 
+import re
 import threading
 import unicodedata
 import xmlrpc.client
@@ -264,6 +265,22 @@ def filtrar_vendedores_excluidos(df: pd.DataFrame, col: str = "vendedor") -> pd.
     if df is None or df.empty or col not in df.columns:
         return df
     return df[~df[col].map(_vendedor_excluido)].copy()
+
+
+# Asuntos de correo (Re:/Fw:/…) que Odoo/emails a menudo crean como leads basura.
+_RE_ASUNTO_CORREO = re.compile(r"^\s*(re|fw|fwd|rv|res)\s*:", re.IGNORECASE)
+
+
+def es_lead_respuesta_correo(nombre) -> bool:
+    """True si el nombre parece un asunto de respuesta/reenvío de correo."""
+    return bool(_RE_ASUNTO_CORREO.match(str(nombre or "")))
+
+
+def filtrar_leads_correo(df: pd.DataFrame, col: str = "name") -> pd.DataFrame:
+    """Excluye leads/oportunidades creados desde respuestas de correo (Re:, Fw:, …)."""
+    if df is None or df.empty or col not in df.columns:
+        return df
+    return df[~df[col].map(es_lead_respuesta_correo)].copy()
 
 
 CODIGOS_HORAS_GC = {
@@ -546,7 +563,7 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["etapa"] = m2o_name(df["stage_id"])
     df["tipo"] = df["type"].map({"lead": "Lead", "opportunity": "Oportunidad"}).fillna(df["type"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
-    return filtrar_vendedores_excluidos(df)
+    return filtrar_leads_correo(filtrar_vendedores_excluidos(df))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando metas...")
@@ -608,7 +625,7 @@ def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["cliente"] = m2o_name(df["partner_id"])
-    return filtrar_vendedores_excluidos(df)
+    return filtrar_leads_correo(filtrar_vendedores_excluidos(df))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando ganados por línea...")
@@ -645,7 +662,7 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["es_nuevo"] = clasificacion.apply(lambda c: c[1])
     df["segmento"] = df["es_nuevo"].map({True: "Nuevo", False: "Recurrente"})
     df = df.explode("linea")
-    return filtrar_vendedores_excluidos(df[cols])
+    return filtrar_leads_correo(filtrar_vendedores_excluidos(df[cols]))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cumplimiento mensual por línea...")
@@ -769,7 +786,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["medio"] = m2o_name(df["medium_id"])
     df["origen"] = m2o_name(df["source_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
-    return filtrar_vendedores_excluidos(df)
+    return filtrar_leads_correo(filtrar_vendedores_excluidos(df))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cierres del período...")
@@ -805,7 +822,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida"})
-    return filtrar_vendedores_excluidos(df)
+    return filtrar_leads_correo(filtrar_vendedores_excluidos(df))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando meta de contratos de soporte...")
@@ -1875,82 +1892,131 @@ with tab_fact:
 # TAB 3: CRM (crm.lead)
 # ─────────────────────────────────────────────
 with tab_crm:
-    st.caption("Incluye **leads y oportunidades** del período (crm.lead). Los leads aún "
-               "no convertidos —sobre todo sin vendedor— también aparecen aquí.")
-    if leads.empty:
-        st.info("No hay leads ni oportunidades creadas en el período seleccionado.")
+    st.caption(
+        "Pipeline abierto = leads/oportunidades **creadas** en el rango del sidebar que "
+        "siguen abiertas (valor esperado). "
+        "**Lo ganado** se toma por **fecha de cierre** (`date_closed`), no por fecha de "
+        "creación: incluye oportunidades abiertas desde antes que se cerraron en este "
+        "período. Se excluyen asuntos de correo tipo `Re:` / `Fw:` que Odoo crea como leads."
+    )
+    # Ganado real del período = cierre en el rango (misma fuente que Metas / Leads).
+    won_crm = load_won(d1, d2, team_ids)
+    closed_crm = closed  # load_pipeline_closed: ganadas+perdidas por date_closed
+
+    if leads.empty and won_crm.empty:
+        st.info("No hay leads/oportunidades creadas ni cierres en el período seleccionado.")
     else:
-        abiertas = leads[leads["estado"] == "Abierta"]
-        ganadas = leads[leads["estado"] == "Ganada"]
-        perdidas = leads[leads["estado"] == "Perdida"]
-        cerradas = len(ganadas) + len(perdidas)
-        win_rate = len(ganadas) / cerradas * 100 if cerradas else 0
-        sin_asignar = leads[leads["vendedor"] == "Sin asignar"]
+        abiertas = leads[leads["estado"] == "Abierta"] if not leads.empty else leads
+        ganadas_cierre = (closed_crm[closed_crm["estado"] == "Ganada"]
+                          if not closed_crm.empty else closed_crm)
+        perdidas_cierre = (closed_crm[closed_crm["estado"] == "Perdida"]
+                           if not closed_crm.empty else closed_crm)
+        cerradas_n = len(ganadas_cierre) + len(perdidas_cierre)
+        win_rate = len(ganadas_cierre) / cerradas_n * 100 if cerradas_n else 0
+        sin_asignar = (leads[leads["vendedor"] == "Sin asignar"]
+                       if not leads.empty else leads)
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Leads + oportunidades", len(leads))
-        c2.metric("Pipeline abierto", fmt_money(abiertas["expected_revenue"].sum()))
-        c3.metric("Ingresos ganados", fmt_money(ganadas["expected_revenue"].sum()))
-        c4.metric("Tasa de conversión", f"{win_rate:.1f}%")
+        c1.metric("Creados en el período", len(leads))
+        c2.metric("Pipeline abierto (valor esperado)",
+                  fmt_money(abiertas["expected_revenue"].sum() if not abiertas.empty else 0))
+        c3.metric("Ganado (fecha de cierre)",
+                  fmt_money(won_crm["expected_revenue"].sum() if not won_crm.empty else 0),
+                  help="Suma de expected_revenue de oportunidades con won_status=won "
+                       "cuya date_closed cae en el rango del sidebar.")
+        c4.metric("Tasa de conversión (por cierre)", f"{win_rate:.1f}%")
         c5.metric("Sin vendedor asignado", len(sin_asignar))
 
         if not sin_asignar.empty:
-            st.warning(
-                f"Hay **{len(sin_asignar)}** registros con vendedor **Sin asignar**. "
-                "Están listados abajo para que no se pierdan del pipeline."
-            )
-            st.dataframe(
-                sin_asignar[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
-                             "expected_revenue", "estado"]],
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "name": "Nombre",
-                    "tipo": "Tipo",
-                    "create_date": "Creado",
-                    "vendedor": "Vendedor",
-                    "equipo": "Equipo",
-                    "etapa": "Etapa",
-                    "expected_revenue": st.column_config.NumberColumn(
-                        "Ingreso esperado", format="$%,.0f"),
-                    "estado": "Estado",
-                },
-            )
+            with st.expander(f"⚠️ {len(sin_asignar)} sin vendedor asignado (tras excluir Re:/Fw:)"):
+                st.dataframe(
+                    sin_asignar[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
+                                 "expected_revenue", "estado"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "name": "Nombre",
+                        "tipo": "Tipo",
+                        "create_date": "Creado",
+                        "expected_revenue": st.column_config.NumberColumn(
+                            "Ingreso esperado", format="$%,.0f"),
+                    },
+                )
 
         col_a, col_b = st.columns(2)
         with col_a:
-            embudo = (abiertas.groupby("etapa", as_index=False)
-                      .agg(oportunidades=("name", "count"),
-                           valor=("expected_revenue", "sum")))
-            fig = px.funnel(embudo, x="valor", y="etapa",
-                            title="Embudo de pipeline abierto (valor esperado)")
-            st.plotly_chart(fig, use_container_width=True, key="chart_20")
+            if abiertas.empty:
+                st.info("No hay pipeline abierto creado en el período.")
+            else:
+                embudo = (abiertas.groupby("etapa", as_index=False)
+                          .agg(oportunidades=("name", "count"),
+                               valor=("expected_revenue", "sum")))
+                fig = px.funnel(embudo, x="valor", y="etapa",
+                                title="Embudo abierto (valor esperado · creados en el período)")
+                st.plotly_chart(fig, use_container_width=True, key="chart_20")
         with col_b:
-            por_equipo = (leads.groupby(["equipo", "estado"], as_index=False)
-                          .agg(n=("name", "count")))
-            fig = px.bar(por_equipo, x="equipo", y="n", color="estado",
-                         title="Leads/oportunidades por equipo y estado",
-                         color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
-                                             "Abierta": "#1f77b4"},
-                         labels={"n": "Cantidad", "equipo": "Equipo"})
-            show_bar_labels(fig, kind="count")
-            st.plotly_chart(fig, use_container_width=True, key="chart_21")
+            if leads.empty:
+                st.info("No hay creados en el período.")
+            else:
+                por_equipo = (leads.groupby(["equipo", "estado"], as_index=False)
+                              .agg(n=("name", "count")))
+                fig = px.bar(por_equipo, x="equipo", y="n", color="estado",
+                             title="Creados por equipo y estado (fecha de creación)",
+                             color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
+                                                 "Abierta": "#1f77b4"},
+                             labels={"n": "Cantidad", "equipo": "Equipo"})
+                show_bar_labels(fig, kind="count")
+                st.plotly_chart(fig, use_container_width=True, key="chart_21")
 
-        por_vendedor = (leads.groupby(["vendedor", "estado"], as_index=False)
-                        .agg(valor=("expected_revenue", "sum")))
-        fig = px.bar(por_vendedor, x="vendedor", y="valor", color="estado",
-                     title="Valor esperado por vendedor",
-                     color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
-                                         "Abierta": "#1f77b4"},
-                     labels={"valor": "Valor esperado", "vendedor": ""})
-        show_bar_labels(fig, kind="money")
-        st.plotly_chart(fig, use_container_width=True, key="chart_22")
+        col_c, col_d = st.columns(2)
+        with col_c:
+            if abiertas.empty:
+                st.info("Sin valor esperado abierto en el período.")
+            else:
+                por_vendedor_abierto = (abiertas.groupby("vendedor", as_index=False)
+                                        .agg(valor=("expected_revenue", "sum"))
+                                        .sort_values("valor", ascending=False))
+                fig = px.bar(por_vendedor_abierto, x="vendedor", y="valor",
+                             title="Valor esperado por vendedor (pipeline abierto)",
+                             labels={"valor": "Valor esperado", "vendedor": ""})
+                show_bar_labels(fig, kind="money")
+                st.plotly_chart(fig, use_container_width=True, key="chart_22")
+        with col_d:
+            if won_crm.empty:
+                st.info("No hay oportunidades ganadas con cierre en el período.")
+            else:
+                por_vendedor_ganado = (won_crm.groupby("vendedor", as_index=False)
+                                       .agg(valor=("expected_revenue", "sum"))
+                                       .sort_values("valor", ascending=False))
+                fig = px.bar(por_vendedor_ganado, x="vendedor", y="valor",
+                             title="Ganado por vendedor (fecha de cierre)",
+                             labels={"valor": "COP", "vendedor": ""},
+                             color_discrete_sequence=["#2ca02c"])
+                show_bar_labels(fig, kind="money")
+                st.plotly_chart(fig, use_container_width=True, key="chart_22b")
 
-        with st.expander("📋 Detalle de leads y oportunidades"):
-            st.dataframe(
-                leads[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
-                       "expected_revenue", "probability", "estado"]],
-                use_container_width=True, hide_index=True,
-            )
+        with st.expander("📋 Detalle: creados en el período (fecha de creación)"):
+            if leads.empty:
+                st.info("Sin registros.")
+            else:
+                st.dataframe(
+                    leads[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
+                           "expected_revenue", "probability", "estado"]],
+                    use_container_width=True, hide_index=True,
+                )
+        with st.expander("📋 Detalle: ganados del período (fecha de cierre)"):
+            if won_crm.empty:
+                st.info("Sin ganados.")
+            else:
+                st.dataframe(
+                    won_crm[["name", "date_closed", "vendedor", "equipo", "cliente",
+                             "expected_revenue"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "date_closed": "Fecha de cierre",
+                        "expected_revenue": st.column_config.NumberColumn(
+                            "Valor ganado", format="$%,.0f"),
+                    },
+                )
 
 # ─────────────────────────────────────────────
 # TAB: Leads y Conversión (todo el pipeline: leads + oportunidades)
