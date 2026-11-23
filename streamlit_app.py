@@ -128,7 +128,8 @@ def load_td_vendedores(team_ids: list[int]) -> pd.DataFrame:
     if not user_ids:
         return pd.DataFrame(columns=["user_id", "vendedor"])
     usuarios = search_read("res.users", [("id", "in", user_ids)], ["id", "name"])
-    return usuarios.rename(columns={"id": "user_id", "name": "vendedor"})
+    return filtrar_vendedores_excluidos(
+        usuarios.rename(columns={"id": "user_id", "name": "vendedor"}))
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
@@ -153,7 +154,7 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["equipo"] = m2o_name(df["team_id"])
     df["vendedor"] = m2o_name(df["user_id"])
     df["cliente"] = m2o_name(df["partner_id"])
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando historial completo de facturación...")
@@ -242,6 +243,8 @@ TIPOS_ACTIVIDAD = [
 LINEAS_ACTIVIDAD = ["Implementación Odoo", "Soporte y Mantenimiento"]
 # Iniciativas / oportunidades de CRM que no deben entrar en ningún KPI del dashboard.
 CRM_LEAD_IDS_EXCLUIDOS = [1475]
+# Vendedores a ocultar en TODO el dashboard (match por substring, sin tildes/mayúsculas).
+VENDEDORES_EXCLUIDOS = ["MARITZA"]
 
 
 def _excluir_crm_leads(domain: list) -> list:
@@ -249,6 +252,18 @@ def _excluir_crm_leads(domain: list) -> list:
     if CRM_LEAD_IDS_EXCLUIDOS:
         domain = list(domain) + [("id", "not in", CRM_LEAD_IDS_EXCLUIDOS)]
     return domain
+
+
+def _vendedor_excluido(nombre) -> bool:
+    n = _normalizar(str(nombre or ""))
+    return any(ex in n for ex in VENDEDORES_EXCLUIDOS)
+
+
+def filtrar_vendedores_excluidos(df: pd.DataFrame, col: str = "vendedor") -> pd.DataFrame:
+    """Quita filas cuyo vendedor coincida con VENDEDORES_EXCLUIDOS."""
+    if df is None or df.empty or col not in df.columns:
+        return df
+    return df[~df[col].map(_vendedor_excluido)].copy()
 
 
 CODIGOS_HORAS_GC = {
@@ -385,7 +400,7 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
     df["cliente_id"] = m2o_id(df["partner_id"])
     df["cliente"] = m2o_name(df["partner_id"])
     df["vendedor"] = m2o_name(df["invoice_user_id"])
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando informe de facturas (COP, sin IVA)...")
@@ -434,7 +449,7 @@ def load_invoice_report(date_from: str, date_to: str, team_ids: list[int]) -> pd
     df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df.columns else "Sin asignar"
     df["cliente"] = m2o_name(df["partner_id"])
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df.columns else "Sin asignar"
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
@@ -462,7 +477,7 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataF
     df["equipo"] = m2o_name(df["team_id"])
     df["vendedor"] = m2o_name(df["invoice_user_id"])
     df["cliente"] = m2o_name(df["partner_id"])
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cartera (Aged Receivable)...")
@@ -503,11 +518,14 @@ def load_aged_receivable(team_ids: list[int], hoy_iso: str):
 
 @st.cache_data(ttl=600, show_spinner="Cargando pipeline CRM...")
 def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    # active in (True, False) para incluir oportunidades perdidas
+    """Leads + oportunidades del período (ambos viven en crm.lead).
+    Antes solo se pedían oportunidades (`type=opportunity`), y los leads aún no
+    convertidos (p. ej. sin vendedor) no aparecían en el pipeline del dashboard."""
+    # active in (True, False) para incluir perdidos/archivados
     domain = [
         ("create_date", ">=", date_from),
         ("create_date", "<=", f"{date_to} 23:59:59"),
-        ("type", "=", "opportunity"),
+        ("type", "in", ["lead", "opportunity"]),
         "|", ("active", "=", True), ("active", "=", False),
     ]
     if team_ids:
@@ -517,7 +535,7 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
         "crm.lead",
         domain,
         ["name", "create_date", "date_closed", "partner_id", "user_id", "team_id",
-         "stage_id", "expected_revenue", "probability", "active", "won_status"],
+         "stage_id", "expected_revenue", "probability", "active", "won_status", "type"],
         order="create_date",
     )
     if df.empty:
@@ -526,8 +544,9 @@ def load_leads(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["equipo"] = m2o_name(df["team_id"])
     df["vendedor"] = m2o_name(df["user_id"])
     df["etapa"] = m2o_name(df["stage_id"])
+    df["tipo"] = df["type"].map({"lead": "Lead", "opportunity": "Oportunidad"}).fillna(df["type"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando metas...")
@@ -538,7 +557,7 @@ def load_metas() -> pd.DataFrame:
     try:
         df = pd.read_csv("data/metas.csv")
         df["vendedor"] = df["vendedor"].str.strip()
-        return df
+        return filtrar_vendedores_excluidos(df)
     except FileNotFoundError:
         return pd.DataFrame(columns=["vendedor", "meta_anual"])
 
@@ -589,7 +608,7 @@ def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["cliente"] = m2o_name(df["partner_id"])
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando ganados por línea...")
@@ -626,7 +645,7 @@ def load_won_lineas(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["es_nuevo"] = clasificacion.apply(lambda c: c[1])
     df["segmento"] = df["es_nuevo"].map({True: "Nuevo", False: "Recurrente"})
     df = df.explode("linea")
-    return df[cols]
+    return filtrar_vendedores_excluidos(df[cols])
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cumplimiento mensual por línea...")
@@ -750,7 +769,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["medio"] = m2o_name(df["medium_id"])
     df["origen"] = m2o_name(df["source_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando cierres del período...")
@@ -786,7 +805,7 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida"})
-    return df
+    return filtrar_vendedores_excluidos(df)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando meta de contratos de soporte...")
@@ -905,7 +924,7 @@ def load_crm_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     df["linea"] = clasificacion.apply(lambda c: c[0])
     df = df.explode("linea")
     df = df[df["linea"].isin(LINEAS_ACTIVIDAD)]
-    return df, None
+    return filtrar_vendedores_excluidos(df), None
 
 
 @st.cache_data(ttl=600, show_spinner="Buscando proyecto Gestión comercial...")
@@ -1009,7 +1028,7 @@ def load_actividades_gc14(date_from: str, date_to: str, team_ids: list[int]):
     df["vendedor"] = df["user_id_num"].map(vendedores_td)
     df = df[df["vendedor"].notna()].copy()
     df["tipo_brief"] = df["tarea"].apply(clasificar_tarea_gc)
-    return df, None
+    return filtrar_vendedores_excluidos(df), None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando costos analíticos por línea...")
@@ -1856,20 +1875,46 @@ with tab_fact:
 # TAB 3: CRM (crm.lead)
 # ─────────────────────────────────────────────
 with tab_crm:
+    st.caption("Incluye **leads y oportunidades** del período (crm.lead). Los leads aún "
+               "no convertidos —sobre todo sin vendedor— también aparecen aquí.")
     if leads.empty:
-        st.info("No hay oportunidades creadas en el período seleccionado.")
+        st.info("No hay leads ni oportunidades creadas en el período seleccionado.")
     else:
         abiertas = leads[leads["estado"] == "Abierta"]
         ganadas = leads[leads["estado"] == "Ganada"]
         perdidas = leads[leads["estado"] == "Perdida"]
         cerradas = len(ganadas) + len(perdidas)
         win_rate = len(ganadas) / cerradas * 100 if cerradas else 0
+        sin_asignar = leads[leads["vendedor"] == "Sin asignar"]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Oportunidades", len(leads))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Leads + oportunidades", len(leads))
         c2.metric("Pipeline abierto", fmt_money(abiertas["expected_revenue"].sum()))
         c3.metric("Ingresos ganados", fmt_money(ganadas["expected_revenue"].sum()))
         c4.metric("Tasa de conversión", f"{win_rate:.1f}%")
+        c5.metric("Sin vendedor asignado", len(sin_asignar))
+
+        if not sin_asignar.empty:
+            st.warning(
+                f"Hay **{len(sin_asignar)}** registros con vendedor **Sin asignar**. "
+                "Están listados abajo para que no se pierdan del pipeline."
+            )
+            st.dataframe(
+                sin_asignar[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
+                             "expected_revenue", "estado"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "name": "Nombre",
+                    "tipo": "Tipo",
+                    "create_date": "Creado",
+                    "vendedor": "Vendedor",
+                    "equipo": "Equipo",
+                    "etapa": "Etapa",
+                    "expected_revenue": st.column_config.NumberColumn(
+                        "Ingreso esperado", format="$%,.0f"),
+                    "estado": "Estado",
+                },
+            )
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1883,10 +1928,10 @@ with tab_crm:
             por_equipo = (leads.groupby(["equipo", "estado"], as_index=False)
                           .agg(n=("name", "count")))
             fig = px.bar(por_equipo, x="equipo", y="n", color="estado",
-                         title="Oportunidades por equipo y estado",
+                         title="Leads/oportunidades por equipo y estado",
                          color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728",
                                              "Abierta": "#1f77b4"},
-                         labels={"n": "Oportunidades", "equipo": "Equipo"})
+                         labels={"n": "Cantidad", "equipo": "Equipo"})
             show_bar_labels(fig, kind="count")
             st.plotly_chart(fig, use_container_width=True, key="chart_21")
 
@@ -1900,9 +1945,9 @@ with tab_crm:
         show_bar_labels(fig, kind="money")
         st.plotly_chart(fig, use_container_width=True, key="chart_22")
 
-        with st.expander("📋 Detalle de oportunidades"):
+        with st.expander("📋 Detalle de leads y oportunidades"):
             st.dataframe(
-                leads[["name", "create_date", "vendedor", "equipo", "etapa",
+                leads[["name", "tipo", "create_date", "vendedor", "equipo", "etapa",
                        "expected_revenue", "probability", "estado"]],
                 use_container_width=True, hide_index=True,
             )
