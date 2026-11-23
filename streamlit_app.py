@@ -383,32 +383,83 @@ def load_product_category_ids() -> dict[str, int]:
     return {row["name"]: int(row["id"]) for _, row in cats.iterrows()}
 
 
-@st.cache_data(ttl=300, show_spinner="Cargando facturación por categoría...")
+def _moves_sin_reversión(move_ids: list[int]) -> set[int]:
+    """account.move sin 'Movimiento de reversión' (filtro INFORME Odoo).
+    Lectura por lotes: un solo search con id in [...] grandes puede truncarse."""
+    ok: set[int] = set()
+    if not move_ids:
+        return ok
+    for i in range(0, len(move_ids), 200):
+        chunk = move_ids[i:i + 200]
+        moves = search_read(
+            "account.move", [("id", "in", chunk)],
+            ["id", "reversal_move_ids"], limit=len(chunk),
+        )
+        if moves.empty:
+            continue
+        for _, row in moves.iterrows():
+            if not (row.get("reversal_move_ids") or []):
+                ok.add(int(row["id"]))
+    return ok
+
+
+def _dominio_informe_categoria(categ_id: int, year: int | None = None) -> list:
+    """Dominio del filtro personalizado INFORME / Análisis de Facturas."""
+    domain: list = [
+        # (factura|NC cliente) ∧ (factura cliente|proveedor) ⇒ solo out_invoice
+        ("move_type", "=", "out_invoice"),
+        ("state", "not in", ["draft", "cancel"]),
+        ("product_categ_id", "=", categ_id),
+        ("move_id.reversal_move_ids", "=", False),
+    ]
+    if year is not None:
+        domain += [
+            ("invoice_date", ">=", f"{year}-01-01"),
+            ("invoice_date", "<=", f"{year}-12-31"),
+        ]
+    return domain
+
+
+def _mes_key_from_group(label) -> str | None:
+    """Normaliza etiqueta de read_group invoice_date:month → YYYY-MM."""
+    if label is None:
+        return None
+    if isinstance(label, (list, tuple)) and label:
+        label = label[0]
+    s = str(label)
+    if len(s) >= 7 and s[4] == "-":
+        return s[:7]
+    # "enero 2026" / "January 2026"
+    meses = {
+        "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+        "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+        "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+    }
+    parts = s.strip().lower().replace(",", " ").split()
+    if len(parts) >= 2:
+        m = meses.get(parts[0])
+        y = parts[-1]
+        if m and y.isdigit() and len(y) == 4:
+            return f"{y}-{m}"
+    return None
+
+
+@st.cache_data(ttl=120, show_spinner="Cargando facturación por categoría...")
 def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None = None) -> pd.DataFrame:
-    """Historial de líneas de factura de una categoría, en COP sin IVA.
-
-    Mismo dominio por defecto que Análisis de Facturas (Odoo 19):
-    - Customers: out_invoice + out_refund
-    - Invoiced: state not in (draft, cancel)
-    - product_categ_id child_of (filter_domain del search view)
-    - price_subtotal (sin IVA, moneda compañía)
-
-    NO filtra reversal_move_ids: el pivote estándar de Odoo tampoco; factura + NC
-    se nettian solas. No filtra por equipo ni vendedor.
-    """
+    """Líneas facturadas de una categoría, COP sin IVA (dominio INFORME)."""
     del team_ids
     categ_ids = load_product_category_ids()
     categ_id = categ_ids.get(categoria)
     if not categ_id:
         return pd.DataFrame(columns=["date", "partner_id", "monto", "mes",
                                      "cliente_id", "cliente", "vendedor"])
-    domain = [
-        ("move_type", "in", ["out_invoice", "out_refund"]),
-        ("state", "not in", ["draft", "cancel"]),
-        ("product_categ_id", "child_of", categ_id),
-    ]
+    domain = _dominio_informe_categoria(categ_id)
     fields_air = ["invoice_date", "partner_id", "invoice_user_id", "team_id",
                   "price_subtotal", "move_id", "product_categ_id"]
+    df = pd.DataFrame()
     try:
         try:
             df = search_read(
@@ -416,14 +467,22 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
                 order="invoice_date asc, id asc",
             )
         except Exception:
-            # Algunas instancias no aceptan order compuesto en el SQL view.
-            df = search_read("account.invoice.report", domain, fields_air)
+            # Si el dotted reversal falla en el report, cargamos sin él y filtramos.
+            domain_no_rev = [d for d in domain if not (
+                isinstance(d, (list, tuple)) and d and "reversal" in str(d[0]))]
+            df = search_read("account.invoice.report", domain_no_rev, fields_air)
+            if not df.empty:
+                move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
+                ok_ids = _moves_sin_reversión(move_ids)
+                df = df[df["move_id"].map(lambda m: _m2o_id_one(m) in ok_ids)].copy()
     except Exception:
+        df = pd.DataFrame()
+    if df.empty:
         domain_aml = [
-            ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
+            ("move_id.move_type", "=", "out_invoice"),
             ("move_id.state", "not in", ["draft", "cancel"]),
             ("display_type", "=", "product"),
-            ("product_id.categ_id", "child_of", categ_id),
+            ("product_id.categ_id", "=", categ_id),
         ]
         df = search_read(
             "account.move.line", domain_aml,
@@ -433,19 +492,31 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
         if df.empty:
             return df
         move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
-        move_dates = {}
-        if move_ids:
-            for i in range(0, len(move_ids), 200):
-                chunk = move_ids[i:i + 200]
-                moves = search_read("account.move", [("id", "in", chunk)],
-                                    ["id", "invoice_date"], limit=len(chunk))
-                for _, r in moves.iterrows():
-                    move_dates[int(r["id"])] = r.get("invoice_date")
-        df["invoice_date"] = df["move_id"].apply(
-            lambda m: move_dates.get(_m2o_id_one(m)))
+        ok_ids = _moves_sin_reversión(move_ids)
+        df = df[df["move_id"].map(lambda m: _m2o_id_one(m) in ok_ids)].copy()
+        if df.empty:
+            return df
+        move_dates: dict[int, object] = {}
+        for i in range(0, len(move_ids), 200):
+            chunk = [mid for mid in move_ids[i:i + 200] if mid in ok_ids]
+            if not chunk:
+                continue
+            moves = search_read("account.move", [("id", "in", chunk)],
+                                ["id", "invoice_date"], limit=len(chunk))
+            for _, r in moves.iterrows():
+                move_dates[int(r["id"])] = r.get("invoice_date")
+        df["invoice_date"] = df["move_id"].apply(lambda m: move_dates.get(_m2o_id_one(m)))
         df["invoice_date"] = df["invoice_date"].fillna(df["date"])
         df["invoice_user_id"] = None
         df["price_subtotal"] = -pd.to_numeric(df["balance"], errors="coerce").fillna(0)
+    if df.empty:
+        return df
+    # Reaplicar filtro de reversión por lotes (garantiza paridad aunque el
+    # dominio dotted en account.invoice.report no esté disponible).
+    if "move_id" in df.columns:
+        move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
+        ok_ids = _moves_sin_reversión(move_ids)
+        df = df[df["move_id"].map(lambda m: _m2o_id_one(m) in ok_ids)].copy()
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["invoice_date"], errors="coerce").dt.normalize()
@@ -457,20 +528,44 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
     return df
 
 
-@st.cache_data(ttl=300, show_spinner="Cargando pivote de facturación por línea...")
+@st.cache_data(ttl=120, show_spinner="Cargando pivote de facturación por línea...")
 def load_facturacion_pivote_anual(year: int) -> pd.DataFrame:
-    """Pivote mes × categoría (Licenciamiento / Soporte / Transformación digital).
-    Usa load_invoice_lines_by_categoria (mismo dominio que Análisis de Facturas)."""
+    """Pivote mes × categoría vía read_group (misma agregación que el pivote Odoo)."""
     meses = [f"{year}-{m:02d}" for m in range(1, 13)]
     orden_cats = ["Licenciamiento", "Soporte", "Transformación digital"]
+    categ_ids = load_product_category_ids()
     filas = []
     for categoria in orden_cats:
+        categ_id = categ_ids.get(categoria)
+        if not categ_id:
+            continue
+        domain = _dominio_informe_categoria(categ_id, year=year)
+        groups = None
+        try:
+            groups = odoo_call(
+                "account.invoice.report", "read_group",
+                [domain, ["price_subtotal"], ["invoice_date:month"]],
+                {"lazy": False},
+            )
+        except Exception:
+            groups = None
+        if groups is not None:
+            for g in groups:
+                mes = _mes_key_from_group(
+                    g.get("invoice_date:month") or g.get("invoice_date"))
+                if not mes:
+                    continue
+                filas.append({
+                    "mes": mes,
+                    "categoria": categoria,
+                    "monto": float(g.get("price_subtotal") or 0),
+                })
+            continue
+        # Fallback: líneas
         lf = load_invoice_lines_by_categoria(categoria)
         if lf.empty:
             continue
         lf = lf[lf["date"].dt.year == year]
-        if lf.empty:
-            continue
         for mes, monto in lf.groupby("mes")["monto"].sum().items():
             filas.append({"mes": mes, "categoria": categoria, "monto": float(monto)})
     if not filas:
@@ -1729,8 +1824,8 @@ with tab_ventas:
 # ─────────────────────────────────────────────
 with tab_fact:
     st.caption("Facturación **antes de impuestos** (`account.invoice.report.price_subtotal`). "
-               "Misma lógica que Contabilidad → Análisis de Facturas: facturas/NC de "
-               "cliente no borrador/canceladas, por categoría de producto (`child_of`).")
+               "Misma lógica que el INFORME / Análisis de Facturas: facturas de cliente "
+               "no borrador/canceladas, **sin movimiento de reversión**, categoría exacta.")
 
     st.markdown("#### 📊 Facturación por línea (pivote Análisis de Facturas)")
     st.caption("Columnas = categorías **Licenciamiento / Soporte / Transformación digital** "
@@ -2823,23 +2918,52 @@ with tab_clientes:
 # TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
 # ─────────────────────────────────────────────
 with tab_soporte:
-    st.caption("Misma fuente que INFORME SOPORTE / Análisis de Facturas (Odoo 19): "
-               "`price_subtotal` sin IVA, categoría **Soporte** (`child_of`), facturas/NC "
-               "de cliente con estado Invoiced (`state` ≠ draft/cancel). "
-               "Incluye facturas revertidas y sus NC (como el pivote de Odoo). "
-               "No filtra por equipo ni vendedor. Recarga con **R** si ves datos viejos.")
+    st.caption("Misma fuente que INFORME SOPORTE: `price_subtotal` sin IVA, categoría "
+               "**Soporte** exacta, solo **factura de cliente**, estado ≠ borrador/cancelado, "
+               "**sin movimiento de reversión**. Recarga con **R** si ves caché vieja.")
     soporte_lines = load_invoice_lines_by_categoria(LINEA_CATEGORIA["Soporte y Mantenimiento"])
 
     if soporte_lines.empty:
         st.info("No hay facturación de la categoría 'Soporte' en el historial.")
     else:
-        # Total año calendario (referencia INFORME ≈ 193.145.600 en 2026)
         anio_ref = hoy.year
-        total_anio_sop = float(
-            soporte_lines.loc[soporte_lines["date"].dt.year == anio_ref, "monto"].sum())
-        st.metric(f"Soporte facturado {anio_ref} (sin IVA)", fmt_money(total_anio_sop),
-                  help="Suma de price_subtotal del año calendario, misma base que el "
-                       "pivote de Análisis de Facturas filtrado por categoría Soporte.")
+        sop_anio = soporte_lines[soporte_lines["date"].dt.year == anio_ref]
+        total_anio_sop = float(sop_anio["monto"].sum()) if not sop_anio.empty else 0.0
+        # Referencia INFORME 2026 (Análisis de Facturas con el filtro personalizado).
+        ref_soporte_2026 = 193_145_600.00
+        delta = total_anio_sop - ref_soporte_2026 if anio_ref == 2026 else None
+        st.metric(
+            f"Soporte facturado {anio_ref} (sin IVA)",
+            fmt_money(total_anio_sop),
+            delta=(f"{delta:+,.0f} vs INFORME" if delta is not None else None),
+            help="Debe coincidir con Análisis de Facturas → categoría Soporte "
+                 "(193.145.600 en 2026 con el filtro del INFORME).",
+        )
+        if anio_ref == 2026 and not sop_anio.empty:
+            mens_ref = {
+                "2026-01": 14_554_400.0, "2026-02": 8_210_800.0, "2026-03": 18_344_000.0,
+                "2026-04": 16_460_800.0, "2026-05": 12_160_800.0, "2026-06": 9_160_000.0,
+                "2026-07": 29_261_600.0, "2026-08": 21_510_800.0, "2026-09": 22_360_800.0,
+                "2026-10": 20_560_800.0, "2026-11": 20_560_800.0,
+            }
+            mens_dash = sop_anio.groupby("mes")["monto"].sum().to_dict()
+            filas_cmp = []
+            for mes, ref in mens_ref.items():
+                val = float(mens_dash.get(mes, 0.0))
+                filas_cmp.append({
+                    "Mes": mes, "Dashboard": val, "INFORME": ref,
+                    "Diff": val - ref,
+                })
+            cmp_df = pd.DataFrame(filas_cmp)
+            with st.expander("🔎 Soporte 2026: dashboard vs INFORME (por mes)", expanded=abs(delta or 0) > 1):
+                st.dataframe(
+                    cmp_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Dashboard": st.column_config.NumberColumn(format="$%,.2f"),
+                        "INFORME": st.column_config.NumberColumn(format="$%,.2f"),
+                        "Diff": st.column_config.NumberColumn(format="$%,.2f"),
+                    },
+                )
         # Primera vez que se facturó Soporte a cada cliente (sin límite de fecha)
         primera_soporte = (soporte_lines.groupby("cliente_id")["date"].min()
                            .rename("primera_factura_soporte"))
