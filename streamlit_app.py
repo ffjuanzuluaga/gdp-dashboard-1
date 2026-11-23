@@ -356,14 +356,16 @@ def load_product_category_ids() -> dict[str, int]:
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturación por categoría...")
 def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None = None) -> pd.DataFrame:
-    """Historial de líneas de factura de una categoría, en COP de la compañía y
-    SIN impuestos. Misma lógica que Contabilidad → Análisis de Facturas (Odoo 19):
-    `account.invoice.report.price_subtotal` (= -line.balance * rate) y filtro de
-    categoría con `child_of` (como el search view estándar). No se filtra por
-    equipo de ventas: el informe de referencia (p. ej. INFORME SOPORTE) agrupa
-    solo por categoría de producto. `team_ids` se ignora a propósito (firma
-    conservada por callers)."""
-    del team_ids  # la clasificación es por categoría, no por crm.team
+    """Historial de líneas de factura de una categoría, en COP sin IVA.
+    Alineado al filtro de Análisis de Facturas (Odoo 19 / INFORME SOPORTE):
+    - move_type in (out_invoice, out_refund)
+    - state = posted (no borrador/cancelado)
+    - product_categ_id = categoría exacta (mismas columnas del pivote)
+    - move_id.reversal_move_ids vacío (factura no revertida)
+    - invoice_date
+    - price_subtotal (= -line.balance * rate)
+    No filtra por equipo ni por vendedor (el informe de referencia tampoco)."""
+    del team_ids
     categ_ids = load_product_category_ids()
     categ_id = categ_ids.get(categoria)
     if not categ_id:
@@ -372,22 +374,21 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
-        # Odoo 19: filter_domain del Análisis de Facturas usa child_of, no "=".
-        ("product_categ_id", "child_of", categ_id),
+        ("product_categ_id", "=", categ_id),
     ]
     try:
         df = search_read(
             "account.invoice.report", domain,
-            ["invoice_date", "partner_id", "invoice_user_id", "team_id", "price_subtotal"],
+            ["invoice_date", "partner_id", "invoice_user_id", "team_id",
+             "price_subtotal", "move_id"],
             order="invoice_date",
         )
     except Exception:
-        # Fallback: balance de la línea está en moneda de la compañía (COP).
         domain_aml = [
             ("move_id.move_type", "in", ["out_invoice", "out_refund"]),
             ("move_id.state", "=", "posted"),
             ("display_type", "=", "product"),
-            ("product_id.categ_id", "child_of", categ_id),
+            ("product_id.categ_id", "=", categ_id),
         ]
         df = search_read(
             "account.move.line", domain_aml,
@@ -396,7 +397,6 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
         )
         if df.empty:
             return df
-        # Preferir invoice_date del move (igual que account.invoice.report).
         move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
         move_dates = {}
         if move_ids:
@@ -410,14 +410,65 @@ def load_invoice_lines_by_categoria(categoria: str, team_ids: list[int] | None =
         df["price_subtotal"] = -pd.to_numeric(df["balance"], errors="coerce").fillna(0)
     if df.empty:
         return df
-    # Fecha de factura (Date) → mes calendario, sin zonas horarias.
+    # Excluir facturas con movimiento de reversión (mismo filtro del INFORME Odoo).
+    if "move_id" in df.columns:
+        move_ids = sorted({mid for mid in (_m2o_id_one(v) for v in df["move_id"].tolist()) if mid})
+        if move_ids:
+            moves = search_read(
+                "account.move",
+                [("id", "in", move_ids), ("reversal_move_ids", "=", False)],
+                ["id"],
+            )
+            ok_ids = set(int(r["id"]) for _, r in moves.iterrows()) if not moves.empty else set()
+            df = df[df["move_id"].map(lambda m: _m2o_id_one(m) in ok_ids)].copy()
+    if df.empty:
+        return df
     df["date"] = pd.to_datetime(df["invoice_date"], errors="coerce").dt.normalize()
     df["monto"] = pd.to_numeric(df["price_subtotal"], errors="coerce").fillna(0)
     df["mes"] = df["date"].dt.strftime("%Y-%m")
     df["cliente_id"] = m2o_id(df["partner_id"])
     df["cliente"] = m2o_name(df["partner_id"])
     df["vendedor"] = m2o_name(df["invoice_user_id"])
-    return filtrar_vendedores_excluidos(df)
+    # No filtrar por VENDEDORES_EXCLUIDOS: el pivote de Odoo no excluye vendedores.
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando pivote de facturación por línea...")
+def load_facturacion_pivote_anual(year: int) -> pd.DataFrame:
+    """Pivote mes × categoría (Licenciamiento / Soporte / Transformación digital),
+    mismo layout que Análisis de Facturas agrupado por invoice_date:month y
+    product_categ_id. Valores = price_subtotal (sin IVA)."""
+    meses = [f"{year}-{m:02d}" for m in range(1, 13)]
+    # Orden de columnas como en el pivote de Odoo
+    orden_cats = ["Licenciamiento", "Soporte", "Transformación digital"]
+    filas = []
+    for linea, categoria in LINEA_CATEGORIA.items():
+        lf = load_invoice_lines_by_categoria(categoria)
+        if lf.empty:
+            continue
+        lf = lf[lf["date"].dt.year == year]
+        if lf.empty:
+            continue
+        for mes, monto in lf.groupby("mes")["monto"].sum().items():
+            filas.append({"mes": mes, "categoria": categoria, "monto": float(monto)})
+    if not filas:
+        piv = pd.DataFrame(0.0, index=meses, columns=orden_cats)
+    else:
+        bruto = pd.DataFrame(filas)
+        piv = (bruto.pivot_table(index="mes", columns="categoria", values="monto",
+                                 aggfunc="sum", fill_value=0.0)
+               .reindex(index=meses, fill_value=0.0))
+        for c in orden_cats:
+            if c not in piv.columns:
+                piv[c] = 0.0
+        piv = piv[orden_cats]
+    piv["Total"] = piv[orden_cats].sum(axis=1)
+    # Fila Total arriba (como el pivote de Odoo)
+    total_row = piv.sum(axis=0).to_frame().T
+    total_row.index = ["Total"]
+    piv = pd.concat([total_row, piv])
+    piv.index.name = "mes"
+    return piv.reset_index().rename(columns={"mes": "Mes"})
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando informe de facturas (COP, sin IVA)...")
@@ -1652,13 +1703,46 @@ with tab_ventas:
 # TAB 2: Facturación (account.move + Aged Receivable)
 # ─────────────────────────────────────────────
 with tab_fact:
-    st.caption("Facturación **antes de impuestos** (`amount_untaxed_signed` / "
-               "`account.invoice.report.price_subtotal`, COP de la compañía). "
-               "La cartera usa la misma lógica que Contabilidad → Aged Receivable "
-               "(`account_reports.aged_receivable_report`): residual de líneas "
-               "receivable, cubos de 30 días por fecha de vencimiento. El saldo "
-               "de cartera incluye IVA (lo que el cliente debe); no se compara 1:1 "
-               "con lo facturado sin impuestos.")
+    st.caption("Facturación **antes de impuestos** (`account.invoice.report.price_subtotal`). "
+               "Misma lógica que Contabilidad → Análisis de Facturas: facturas/NC de "
+               "cliente publicadas, sin movimiento de reversión, por categoría de producto.")
+
+    st.markdown("#### 📊 Facturación por línea (pivote Análisis de Facturas)")
+    st.caption("Columnas = categorías **Licenciamiento / Soporte / Transformación digital** "
+               "(subtotal sin IVA). Filas = meses del año. Equivalente al pivote de Odoo.")
+    anio_fact_piv = st.selectbox(
+        "Año del pivote", options=range(hoy.year, hoy.year - 4, -1),
+        index=0, key="anio_facturacion_pivote")
+    piv_fact = load_facturacion_pivote_anual(anio_fact_piv)
+    st.dataframe(
+        piv_fact,
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Mes": "Mes",
+            "Licenciamiento": st.column_config.NumberColumn("Licenciamiento", format="$%,.2f"),
+            "Soporte": st.column_config.NumberColumn("Soporte", format="$%,.2f"),
+            "Transformación digital": st.column_config.NumberColumn(
+                "Transformación digital", format="$%,.2f"),
+            "Total": st.column_config.NumberColumn("Total", format="$%,.2f"),
+        },
+    )
+    # Gráfico mensual apilado por categoría (sin la fila Total)
+    piv_chart = piv_fact[piv_fact["Mes"] != "Total"].melt(
+        id_vars="Mes",
+        value_vars=["Licenciamiento", "Soporte", "Transformación digital"],
+        var_name="categoria", value_name="monto")
+    if not piv_chart.empty and piv_chart["monto"].sum() != 0:
+        fig = px.bar(
+            piv_chart, x="Mes", y="monto", color="categoria", barmode="stack",
+            title=f"Facturado sin IVA por mes y categoría — {anio_fact_piv}",
+            labels={"monto": "COP sin IVA", "Mes": "Mes", "categoria": "Categoría"},
+        )
+        add_stack_totals(fig, piv_chart, "Mes", "monto", kind="money")
+        st.plotly_chart(fig, use_container_width=True, key="chart_fact_pivote")
+
+    st.divider()
+    st.markdown("#### Facturación del período (filtro del sidebar · por equipo TD)")
+    st.caption("Cartera = Aged Receivable (incluye IVA). Lo facturado abajo es sin IVA.")
 
     if invoices.empty:
         st.info("No hay facturas publicadas en el período seleccionado.")
@@ -2111,9 +2195,39 @@ with tab_leads:
             )
             conv_medio["tasa_conversion"] = conv_medio.apply(
                 lambda r: r["ganadas"] / r["cerradas"] * 100 if r["cerradas"] else 0, axis=1)
+            conv_medio = conv_medio.sort_values("cerradas", ascending=False)
             st.markdown("#### Conversión por medio (por fecha de cierre)")
+            st.caption("Ganadas / Cerradas con **date_closed** en el rango del sidebar.")
+
+            col_cm1, col_cm2 = st.columns(2)
+            with col_cm1:
+                fig = px.bar(
+                    conv_medio.sort_values("tasa_conversion", ascending=True),
+                    x="tasa_conversion", y="medio", orientation="h",
+                    title="% conversión por medio",
+                    labels={"tasa_conversion": "% conversión", "medio": ""},
+                )
+                show_bar_labels(fig, kind="pct")
+                st.plotly_chart(fig, use_container_width=True, key="chart_conv_medio_pct")
+            with col_cm2:
+                conv_largo = conv_medio.melt(
+                    id_vars="medio", value_vars=["ganadas", "cerradas"],
+                    var_name="concepto", value_name="cantidad")
+                conv_largo["concepto"] = conv_largo["concepto"].map(
+                    {"ganadas": "Ganadas", "cerradas": "Cerradas"})
+                orden_medios = conv_medio["medio"].tolist()
+                fig = px.bar(
+                    conv_largo, x="medio", y="cantidad", color="concepto",
+                    barmode="group", title="Ganadas vs. cerradas por medio",
+                    category_orders={"medio": orden_medios},
+                    color_discrete_map={"Ganadas": "#2ca02c", "Cerradas": "#9ca3af"},
+                    labels={"cantidad": "Cantidad", "medio": "Medio"},
+                )
+                show_bar_labels(fig, kind="count")
+                st.plotly_chart(fig, use_container_width=True, key="chart_conv_medio_vol")
+
             st.dataframe(
-                conv_medio.sort_values("cerradas", ascending=False),
+                conv_medio,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "medio": "Medio",
@@ -2627,9 +2741,9 @@ with tab_clientes:
 # TAB: Soporte y Mantenimiento (categoría de producto "Soporte")
 # ─────────────────────────────────────────────
 with tab_soporte:
-    st.caption("Misma fuente que Contabilidad → Análisis de Facturas (Odoo 19): "
-               "`account.invoice.report.price_subtotal` (sin IVA), categoría **Soporte** "
-               "con `child_of` (incluye subcategorías). No filtra por equipo de ventas.")
+    st.caption("Misma fuente que INFORME SOPORTE / Análisis de Facturas (Odoo 19): "
+               "`price_subtotal` sin IVA, categoría **Soporte** exacta, facturas/NC "
+               "publicadas y **sin movimiento de reversión**. No filtra por equipo ni vendedor.")
     soporte_lines = load_invoice_lines_by_categoria(LINEA_CATEGORIA["Soporte y Mantenimiento"])
 
     if soporte_lines.empty:
