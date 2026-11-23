@@ -861,18 +861,22 @@ def load_pipeline_closed(date_from: str, date_to: str, team_ids: list[int]) -> p
     domain = _excluir_crm_leads(domain)
     df = search_read(
         "crm.lead", domain,
-        ["name", "date_closed", "user_id", "team_id", "medium_id",
+        ["name", "create_date", "date_closed", "user_id", "team_id", "medium_id",
          "expected_revenue", "probability", "active", "won_status"],
         order="date_closed",
     )
     if df.empty:
         return df
+    df["create_date"] = pd.to_datetime(df["create_date"])
     df["date_closed"] = pd.to_datetime(df["date_closed"])
     df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["medio"] = m2o_name(df["medium_id"])
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida"})
+    # Días entre creación y cierre (ciclo comercial).
+    df["dias_ciclo"] = (df["date_closed"] - df["create_date"]).dt.total_seconds() / 86400.0
+    df["dias_ciclo"] = df["dias_ciclo"].clip(lower=0).round(1)
     return filtrar_leads_correo(filtrar_vendedores_excluidos(df))
 
 
@@ -2099,6 +2103,63 @@ with tab_crm:
                         "date_closed": "Fecha de cierre",
                         "expected_revenue": st.column_config.NumberColumn(
                             "Valor ganado", format="$%,.0f"),
+                    },
+                )
+
+        st.divider()
+        st.markdown("#### ⏱️ Tiempo de ciclo: creación → cierre")
+        st.caption("Días entre `create_date` y `date_closed` de oportunidades "
+                   "**cerradas en el período** (ganadas y perdidas). No incluye abiertas.")
+        if closed_crm.empty or "dias_ciclo" not in closed_crm.columns:
+            st.info("No hay cierres con fechas de creación/cierre para medir el ciclo.")
+        else:
+            ciclo = closed_crm.dropna(subset=["dias_ciclo"]).copy()
+            ciclo_gan = ciclo[ciclo["estado"] == "Ganada"]
+            ciclo_per = ciclo[ciclo["estado"] == "Perdida"]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Promedio general", f"{ciclo['dias_ciclo'].mean():.1f} días")
+            m2.metric("Mediana general", f"{ciclo['dias_ciclo'].median():.1f} días")
+            m3.metric("Promedio ganadas",
+                      f"{ciclo_gan['dias_ciclo'].mean():.1f} días" if not ciclo_gan.empty else "—")
+            m4.metric("Promedio perdidas",
+                      f"{ciclo_per['dias_ciclo'].mean():.1f} días" if not ciclo_per.empty else "—")
+
+            col_t1, col_t2 = st.columns(2)
+            with col_t1:
+                por_vend_ciclo = (ciclo.groupby("vendedor", as_index=False)
+                                  .agg(dias_promedio=("dias_ciclo", "mean"),
+                                       n=("name", "count"))
+                                  .sort_values("dias_promedio", ascending=True))
+                fig = px.bar(
+                    por_vend_ciclo, x="dias_promedio", y="vendedor", orientation="h",
+                    title="Días promedio creación→cierre por vendedor",
+                    labels={"dias_promedio": "Días", "vendedor": ""},
+                )
+                show_bar_labels(fig, kind="hours")  # 1 decimal
+                st.plotly_chart(fig, use_container_width=True, key="chart_ciclo_vendedor")
+            with col_t2:
+                fig = px.box(
+                    ciclo, x="estado", y="dias_ciclo", color="estado",
+                    title="Distribución de días de ciclo por resultado",
+                    color_discrete_map={"Ganada": "#2ca02c", "Perdida": "#d62728"},
+                    labels={"dias_ciclo": "Días", "estado": ""},
+                )
+                st.plotly_chart(fig, use_container_width=True, key="chart_ciclo_box")
+
+            with st.expander("📋 Detalle de ciclo por oportunidad"):
+                st.dataframe(
+                    ciclo[["name", "create_date", "date_closed", "dias_ciclo",
+                           "vendedor", "medio", "estado", "expected_revenue"]]
+                    .sort_values("dias_ciclo", ascending=False),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "name": "Oportunidad",
+                        "create_date": "Creado",
+                        "date_closed": "Cerrado",
+                        "dias_ciclo": st.column_config.NumberColumn("Días ciclo", format="%.1f"),
+                        "expected_revenue": st.column_config.NumberColumn(
+                            "Valor", format="$%,.0f"),
                     },
                 )
 
