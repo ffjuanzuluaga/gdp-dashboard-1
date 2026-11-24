@@ -1340,6 +1340,39 @@ def show_bar_labels(fig, kind: str = "count", text_size: int | None = None):
     return fig
 
 
+def fmt_money_compact(v: float) -> str:
+    """Etiqueta corta para segmentos de barras ($14.6M / $820K)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or float(v) == 0:
+        return ""
+    num = float(v)
+    sign = "-" if num < 0 else ""
+    num = abs(num)
+    if num >= 1_000_000:
+        return f"{sign}${num / 1_000_000:.1f}M"
+    if num >= 1_000:
+        return f"{sign}${num / 1_000:.0f}K"
+    return f"{sign}${num:,.0f}"
+
+
+def add_stack_segment_labels(fig, kind: str = "money"):
+    """Muestra el monto de cada segmento dentro de la barra apilada."""
+    for tr in fig.data:
+        if getattr(tr, "type", None) != "bar":
+            continue
+        vals = list(tr.y or [])
+        if kind == "money":
+            tr.text = [fmt_money_compact(v) for v in vals]
+        else:
+            tr.text = [_fmt_bar_label(v, kind) for v in vals]
+        tr.textposition = "inside"
+        tr.insidetextanchor = "middle"
+        tr.constraintext = "none"
+        tr.textangle = 0
+        tr.textfont = dict(size=10, color="white")
+        tr.cliponaxis = False
+    return fig
+
+
 def add_stack_totals(fig, df: pd.DataFrame, x: str, y: str, kind: str = "count"):
     """Anota el total encima de cada barra apilada (suma de segmentos por categoría x)."""
     if df is None or df.empty or x not in df.columns or y not in df.columns:
@@ -1897,12 +1930,17 @@ with tab_fact:
         value_vars=["Licenciamiento", "Soporte", "Transformación digital"],
         var_name="categoria", value_name="monto")
     if not piv_chart.empty and piv_chart["monto"].sum() != 0:
+        st.caption("Cada color muestra el monto de esa línea; arriba de la barra va el total del mes.")
         fig = px.bar(
             piv_chart, x="Mes", y="monto", color="categoria", barmode="stack",
             title=f"Facturado sin IVA por mes y categoría — {anio_fact_piv}",
             labels={"monto": "COP sin IVA", "Mes": "Mes", "categoria": "Categoría"},
+            custom_data=["categoria"],
         )
+        add_stack_segment_labels(fig, kind="money")
         add_stack_totals(fig, piv_chart, "Mes", "monto", kind="money")
+        fig.update_traces(
+            hovertemplate="%{customdata[0]}<br>%{x}<br>%{y:$,.0f}<extra></extra>")
         st.plotly_chart(fig, use_container_width=True, key="chart_fact_pivote")
 
     st.divider()
