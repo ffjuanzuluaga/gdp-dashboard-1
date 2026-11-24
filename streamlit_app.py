@@ -1485,23 +1485,93 @@ with tab_td:
         st.warning("No se encontró `data/metas_lineas.csv` con las metas por línea.")
     else:
         datos_td = load_cumplimiento_mensual(anio_td, team_ids)
-        meta_anual_td = metas_lineas_td["meta_anual"].sum()
-        vendido_anual_td = datos_td["vendido"].sum()
-        facturado_anual_td = datos_td["facturado"].sum()
-        pct_anual_td = (facturado_anual_td / meta_anual_td * 100) if meta_anual_td else 0
-        meta_a_la_fecha_td = meta_prorateada_a_hoy(meta_anual_td, anio_td, hoy)
-        pct_a_la_fecha_td = (facturado_anual_td / meta_a_la_fecha_td * 100) if meta_a_la_fecha_td else 0
+        # Ventas ganadas del pipeline (CRM) del año, por línea — distinto de facturado.
+        won_anio_td = load_won_lineas(
+            f"{anio_td}-01-01", f"{anio_td}-12-31", team_ids)
+        if won_anio_td.empty:
+            pipe_por_linea = pd.DataFrame(columns=["linea", "ventas_ganadas"])
+        else:
+            pipe_por_linea = (
+                won_anio_td[won_anio_td["linea"].isin(LINEA_CATEGORIA)]
+                .groupby("linea", as_index=False)["expected_revenue"]
+                .sum()
+                .rename(columns={"expected_revenue": "ventas_ganadas"})
+            )
+        fact_por_linea = (
+            datos_td.groupby("linea", as_index=False)["facturado"].sum()
+        )
+        resumen_anio = metas_lineas_td.merge(pipe_por_linea, on="linea", how="left")
+        resumen_anio = resumen_anio.merge(fact_por_linea, on="linea", how="left")
+        resumen_anio["ventas_ganadas"] = resumen_anio["ventas_ganadas"].fillna(0.0)
+        resumen_anio["facturado"] = resumen_anio["facturado"].fillna(0.0)
+        resumen_anio["pct_anual"] = resumen_anio.apply(
+            lambda r: r["facturado"] / r["meta_anual"] * 100 if r["meta_anual"] else 0,
+            axis=1,
+        )
+        resumen_anio["meta_a_la_fecha"] = resumen_anio["meta_anual"].apply(
+            lambda m: meta_prorateada_a_hoy(m, anio_td, hoy))
+        resumen_anio["pct_a_la_fecha"] = resumen_anio.apply(
+            lambda r: (r["facturado"] / r["meta_a_la_fecha"] * 100
+                       if r["meta_a_la_fecha"] else 0),
+            axis=1,
+        )
+        # Orden estable de líneas + fila Total
+        orden_lineas = list(LINEA_CATEGORIA.keys())
+        resumen_anio["linea"] = pd.Categorical(
+            resumen_anio["linea"], categories=orden_lineas, ordered=True)
+        resumen_anio = resumen_anio.sort_values("linea")
+        total_row = pd.DataFrame([{
+            "linea": "Total",
+            "meta_anual": resumen_anio["meta_anual"].sum(),
+            "ventas_ganadas": resumen_anio["ventas_ganadas"].sum(),
+            "facturado": resumen_anio["facturado"].sum(),
+            "pct_anual": (
+                resumen_anio["facturado"].sum() / resumen_anio["meta_anual"].sum() * 100
+                if resumen_anio["meta_anual"].sum() else 0),
+            "meta_a_la_fecha": resumen_anio["meta_a_la_fecha"].sum(),
+            "pct_a_la_fecha": (
+                resumen_anio["facturado"].sum() / resumen_anio["meta_a_la_fecha"].sum() * 100
+                if resumen_anio["meta_a_la_fecha"].sum() else 0),
+        }])
+        resumen_tabla = pd.concat([total_row, resumen_anio], ignore_index=True)
+
+        meta_anual_td = float(total_row["meta_anual"].iloc[0])
+        pipe_anual_td = float(total_row["ventas_ganadas"].iloc[0])
+        facturado_anual_td = float(total_row["facturado"].iloc[0])
+        pct_anual_td = float(total_row["pct_anual"].iloc[0])
+        pct_a_la_fecha_td = float(total_row["pct_a_la_fecha"].iloc[0])
 
         st.markdown("#### 🎯 Resumen del año")
+        st.caption("Meta = `metas_lineas.csv`. Ventas ganadas = oportunidades CRM "
+                   "`won` del año (`expected_revenue`, por etiqueta de línea). "
+                   "Facturación = `account.invoice.report` sin IVA (misma base INFORME).")
+        st.dataframe(
+            resumen_tabla[["linea", "meta_anual", "ventas_ganadas", "facturado",
+                           "pct_anual", "pct_a_la_fecha"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "linea": "Línea",
+                "meta_anual": st.column_config.NumberColumn(
+                    "Meta anual", format="$%,.0f"),
+                "ventas_ganadas": st.column_config.NumberColumn(
+                    "Ventas ganadas acumuladas (pipeline)", format="$%,.0f"),
+                "facturado": st.column_config.NumberColumn(
+                    "Facturación acumulada", format="$%,.0f"),
+                "pct_anual": st.column_config.ProgressColumn(
+                    "% cumpl. anual (facturación)", format="%.1f%%",
+                    min_value=0, max_value=150),
+                "pct_a_la_fecha": st.column_config.ProgressColumn(
+                    "% cumpl. a la fecha", format="%.1f%%",
+                    min_value=0, max_value=150),
+            },
+        )
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Meta de ventas año", fmt_money(meta_anual_td))
-        c2.metric("Ventas facturadas del año (sin IVA)", fmt_money(vendido_anual_td))
-        c3.metric("Facturación acumulada del año", fmt_money(facturado_anual_td))
+        c1.metric("Meta anual (total)", fmt_money(meta_anual_td))
+        c2.metric("Ventas ganadas pipeline (total)", fmt_money(pipe_anual_td))
+        c3.metric("Facturación acumulada (total)", fmt_money(facturado_anual_td))
         c4.metric("% cumplimiento anual", f"{pct_anual_td:.1f}%")
         c5.metric("% cumplimiento a la fecha", f"{pct_a_la_fecha_td:.1f}%",
-                  help="Contra la meta prorateada según los días transcurridos del año "
-                       "(no la meta anual completa): 100% = vamos exactamente como se "
-                       "esperaba a estas alturas del año.")
+                  help="Contra la meta prorateada según los días transcurridos del año.")
 
         if anio_td == hoy.year:
             st.markdown("#### 📅 Mes actual")
@@ -1605,31 +1675,6 @@ with tab_td:
                      labels={"facturado": "COP", "mes": "Mes", "linea": "Línea"})
         show_bar_labels(fig, kind="money")
         st.plotly_chart(fig, use_container_width=True, key="chart_3")
-
-        st.markdown("#### 🏆 Meta del año y total facturado por tipo")
-        resumen_tipo = metas_lineas_td.merge(
-            datos_td.groupby("linea", as_index=False)["facturado"].sum(),
-            on="linea", how="left")
-        resumen_tipo["facturado"] = resumen_tipo["facturado"].fillna(0)
-        resumen_tipo["pct"] = resumen_tipo.apply(
-            lambda r: r["facturado"] / r["meta_anual"] * 100 if r["meta_anual"] else 0, axis=1)
-        resumen_tipo["meta_a_la_fecha"] = resumen_tipo["meta_anual"].apply(
-            lambda m: meta_prorateada_a_hoy(m, anio_td, hoy))
-        resumen_tipo["pct_a_la_fecha"] = resumen_tipo.apply(
-            lambda r: r["facturado"] / r["meta_a_la_fecha"] * 100 if r["meta_a_la_fecha"] else 0, axis=1)
-        st.dataframe(
-            resumen_tipo[["linea", "meta_anual", "facturado", "pct", "pct_a_la_fecha"]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "linea": "Línea",
-                "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
-                "facturado": st.column_config.NumberColumn("Total facturado", format="$%,.0f"),
-                "pct": st.column_config.ProgressColumn("% cumplimiento anual", format="%.1f%%",
-                                                        min_value=0, max_value=150),
-                "pct_a_la_fecha": st.column_config.ProgressColumn(
-                    "% cumplimiento a la fecha", format="%.1f%%", min_value=0, max_value=150),
-            },
-        )
 
         st.divider()
         st.markdown("#### 🏅 Top 10 vendedores y clientes")
