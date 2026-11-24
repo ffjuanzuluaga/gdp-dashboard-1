@@ -1359,7 +1359,10 @@ def add_stack_segment_labels(fig, kind: str = "money"):
     for tr in fig.data:
         if getattr(tr, "type", None) != "bar":
             continue
-        vals = list(tr.y or [])
+        raw = tr.y
+        if raw is None:
+            continue
+        vals = list(raw)
         if kind == "money":
             tr.text = [fmt_money_compact(v) for v in vals]
         else:
